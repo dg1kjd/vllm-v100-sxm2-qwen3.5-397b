@@ -47,10 +47,14 @@ def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
 
 _use_sm70_kkt_schedule = os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1") == "1" and _is_sm70()
 _kkt_configs = (
+    # SM70 defaults pinned to BK=64 / num_warps=8 (1Cat-vLLM): num_warps=4 here
+    # spills registers into the per-thread driver stack pools (~1.5 GiB/GPU,
+    # invisible to allocator tools) and runs ~6.7x slower. Still env-overridable
+    # via VLLM_SM70_GDN_KKT_{BK,WARPS,STAGES} for retuning.
     [
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in _parse_int_list("VLLM_SM70_GDN_KKT_BK", [32, 64])
-        for num_warps in _parse_int_list("VLLM_SM70_GDN_KKT_WARPS", [4])
+        for BK in _parse_int_list("VLLM_SM70_GDN_KKT_BK", [64])
+        for num_warps in _parse_int_list("VLLM_SM70_GDN_KKT_WARPS", [8])
         for num_stages in _parse_int_list("VLLM_SM70_GDN_KKT_STAGES", [2])
     ]
     if _use_sm70_kkt_schedule
