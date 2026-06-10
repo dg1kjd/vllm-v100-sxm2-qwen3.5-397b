@@ -42,6 +42,7 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
+- `tclf90/Qwen3.5-397B-A17B-AWQ` for 8-GPU setups
 
 The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
 Replace them with your local model path or a Hugging Face repository id.
@@ -57,6 +58,7 @@ validation.
 | --- | --- |
 | 4 x Tesla V100 32 GB | Main public reference target |
 | 2 x Tesla V100 32 GB | Supported for selected 27B profiles with lower concurrency |
+| 8 x Tesla V100 32 GB | Required for the 397B MoE profile (SXM2/NVLink recommended) |
 
 Typical model placement:
 
@@ -65,6 +67,7 @@ Typical model placement:
   the long-context public default.
 - `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
 - `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
+- `Qwen3.5-397B-A17B-AWQ`: TP8 only; see the dedicated launch example.
 
 Multimodal defaults:
 
@@ -214,6 +217,87 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
+### Qwen3.5-397B-A17B-AWQ, TP8 (8 x V100 32 GB)
+
+Qwen3.5-397B-A17B is a 60-layer hybrid MoE (3 x linear-attention GDN + 1 x
+full attention per group, 512 experts, top-10, ~17B active). The checkpoint is
+bf16-native and runs in fp16 on V100; the SM70 fp16 stability fixes in this
+fork (sublayer saturation guard, shared-expert gate-first ordering) are on by
+default and are required for correct output — without them the model's
+super-weight activation channels overflow fp16 and produce garbage tokens.
+
+Required GDN (linear attention) kernel configuration:
+
+```bash
+export VLLM_SM70_GDN_DELTA_H_BV=16 VLLM_SM70_GDN_DELTA_H_WARPS=4 VLLM_SM70_GDN_DELTA_H_STAGES=1
+export VLLM_SM70_GDN_CHUNK_O_BK=64 VLLM_SM70_GDN_CHUNK_O_BV=64 VLLM_SM70_GDN_CHUNK_O_WARPS=8 VLLM_SM70_GDN_CHUNK_O_STAGES=2
+# optional, trims NCCL buffer memory on 8-GPU boards:
+export NCCL_MAX_NCHANNELS=2 NCCL_MIN_NCHANNELS=1 NCCL_BUFFSIZE=1048576
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+```
+
+Long-context profile (110K context, ~50 tok/s single-stream decode,
+~100 tok/s aggregate at 4 streams, prefill 1.7-3.6K tok/s):
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/Qwen3.5-397B-A17B-AWQ \
+  --served-model-name Qwen3.5-397B-A17B-AWQ \
+  --attention-backend FLASH_ATTN_V100 \
+  --tensor-parallel-size 8 \
+  --gpu-memory-utilization 0.94 \
+  --kv-cache-dtype fp8_e5m2 \
+  --max-model-len 110000 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 1059 \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Profile notes:
+
+- With hybrid-model prefix caching (`align` mode) the attention block size for
+  this config is 1056 tokens. `max_num_batched_tokens` must leave room for one
+  full block plus one token per other decoding sequence, or waiting prefills
+  starve: `1059 = 1056 + (4 - 1)`.
+- `fp8_e5m2` KV cache is quality-validated at this length (5-needle retrieval
+  10/10 at ~104K across depths 2-98%).
+- The KV budget fits about 1.2 x one full-context request; concurrency is for
+  typical few-K to ~30K sessions, with preemption as the safety valve.
+
+MTP speculative-decoding profile (64K context, ~80 tok/s single-stream
+decode, acceptance ~62-73%, ~3.5 tokens per step): the checkpoint ships its
+MTP draft branch in bf16 (12.3 GiB = 1.5 GiB per rank), which does not fit
+next to the KV budget. Quantize the `mtp.*` expert tensors offline to AWQ
+int4 (group size 128, AWQ GEMM layout), keep `mtp.fc` and norms fp16, and
+change `modules_to_not_convert` from `"mtp"` to `"mtp.fc"` in the quant
+config so the loader takes the quantized path (about 0.43 GiB per rank).
+Then change these flags relative to the profile above:
+
+```bash
+  --model /path/to/Qwen3.5-397B-A17B-AWQ-mtp-int4 \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 64000 \
+  --max-num-batched-tokens 1071 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":true}' \
+```
+
+Each decoding sequence consumes `1 + num_speculative_tokens` tokens of the
+batch budget per step, hence `1071 = 1056 + 3 x 5`. 110K context and MTP do
+not fit together at this memory budget; pick by workload.
+
+Client notes for the thinking-mode Qwen models: send
+`"chat_template_kwargs": {"enable_thinking": true}` and allow 4-8K output
+tokens (thinking length is volatile). Anthropic-style coding agents (for
+example Claude Code) can target the server directly via `ANTHROPIC_BASE_URL`;
+the `/v1/messages` endpoint separates reasoning into native thinking blocks
+and supports parallel tool calls.
+
 ## OpenAI-Compatible Request Example
 
 ```bash
@@ -342,6 +426,13 @@ python -m pip install -e . --no-build-isolation
 - If you publish a baseline, include the full launch command, GPU model,
   driver, CUDA runtime, model checkpoint, sampling parameters, prompt length,
   and decode length.
+
+## A Note on Line Endings
+
+Parts of this tree historically shipped with CRLF — and occasionally mixed —
+line endings. The correct line ending is LF, and LF only: this is a Linux
+inference engine, not a Windows batch script. Configure your editor
+accordingly and spare the next contributor the byte-faithful archaeology.
 
 ## WeChat Community
 
