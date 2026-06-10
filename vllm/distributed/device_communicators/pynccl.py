@@ -185,6 +185,67 @@ class PyNcclCommunicator:
 
         if stream is None:
             stream = current_stream()
+
+        # SM70/V100 (1Cat-vLLM): NCCL's vectorized P2P/CUMEM load/store path
+        # requires 16-byte alignment of both pointer and total byte size.
+        # Inductor-compiled graphs can hand us sliced tensors with an unaligned
+        # data_ptr or a size not divisible by 16. Pad/clone to aligned buffers
+        # when needed, otherwise fall through to the fast in-place path.
+        alignment = 16
+        in_size = in_tensor.numel() * in_tensor.element_size()
+        out_size = out_tensor.numel() * out_tensor.element_size()
+        if (
+            in_tensor.data_ptr() % alignment != 0
+            or out_tensor.data_ptr() % alignment != 0
+            or in_size % alignment != 0
+            or out_size % alignment != 0
+            or not in_tensor.is_contiguous()
+            or not out_tensor.is_contiguous()
+        ):
+            in_aligned = in_tensor.contiguous().clone()
+            out_aligned = out_tensor.contiguous().clone()
+
+            in_numel = in_aligned.numel()
+            elem_size = in_aligned.element_size()
+            in_numel_aligned = (
+                ((in_numel * elem_size + alignment - 1) // alignment)
+                * alignment
+                // elem_size
+            )
+
+            if in_numel_aligned != in_numel:
+                in_padded = torch.zeros(
+                    in_numel_aligned,
+                    dtype=in_aligned.dtype,
+                    device=in_aligned.device,
+                )
+                in_padded[:in_numel] = in_aligned.view(-1)
+                in_aligned = in_padded
+                out_padded = torch.empty(
+                    in_numel_aligned,
+                    dtype=out_aligned.dtype,
+                    device=out_aligned.device,
+                )
+                out_aligned = out_padded
+
+            self.nccl.ncclAllReduce(
+                buffer_type(in_aligned.data_ptr()),
+                buffer_type(out_aligned.data_ptr()),
+                in_aligned.numel(),
+                ncclDataTypeEnum.from_torch(in_aligned.dtype),
+                ncclRedOpTypeEnum.from_torch(op),
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+
+            if in_numel_aligned != in_numel:
+                out_tensor.copy_(
+                    out_aligned[: out_tensor.numel()].view(out_tensor.shape)
+                )
+            else:
+                out_tensor.copy_(out_aligned)
+            return out_tensor
+
         self.nccl.ncclAllReduce(
             buffer_type(in_tensor.data_ptr()),
             buffer_type(out_tensor.data_ptr()),

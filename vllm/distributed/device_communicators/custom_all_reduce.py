@@ -150,12 +150,15 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if world_size > 2 and not fully_connected:
+            # SM70/V100 8-GPU (1Cat-vLLM): on a PCIe/partial-NVLink topology we
+            # do NOT disable custom all-reduce. It is required for CUDA-graph
+            # safety here because NCCL hangs during graph capture on SM70, and
+            # all-pairs P2P is available so the IPC kernels are correct.
             logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+                "Custom allreduce is running on a PCIe-only / partial-NVLink "
+                "topology. Eager-mode bandwidth may be lower than full NVLink, "
+                "but it is kept enabled for CUDA-graph safety on this platform."
             )
-            return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -190,9 +193,15 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
-        self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
-        )
+        # SM70/V100 8-GPU (1Cat-vLLM): force the C++ backend to provision and
+        # dispatch custom-AR kernels even though this topology is not a full
+        # NVLink crossbar. All-pairs P2P is present (verified), so the IPC
+        # kernels are correct; self.fully_connected stays accurate above for
+        # eager-mode decisions. NOTE: forcing this flag selects the crossbar-
+        # tuned 1-stage path for small tensors; set VLLM_CUSTOM_ALLREDUCE_ALGO=
+        # 2stage to override for this bifurcated fabric (perf only, not needed
+        # for correctness).
+        self._ptr = ops.init_custom_ar(self.meta_ptrs, self.rank_data, rank, True)
         ops.register_buffer(self._ptr, self.buffer_ptrs)
 
     @contextmanager
@@ -240,7 +249,11 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
+        # SM70/V100 (1Cat-vLLM): also allow custom-AR while a CUDA graph is
+        # being captured. On this platform NCCL hangs during capture, so the
+        # custom kernel is the only graph-safe collective even on a non-crossbar
+        # topology (all-pairs P2P verified -> kernels are correct).
+        if self.world_size == 2 or self.fully_connected or self._IS_CAPTURING:
             return inp_size < self.max_size
         return False
 

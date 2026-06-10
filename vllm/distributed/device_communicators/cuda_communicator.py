@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -21,6 +23,14 @@ from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# NCCL CUMEM (CUDA Virtual Memory Management for P2P) has a known issue on some
+# architectures (e.g. SM70) where cuMemMap fails with a misaligned address
+# during P2P transport setup. See NVIDIA/nccl#1838. Disabling CUMEM forces NCCL
+# to fall back to the older P2P/IPC path. Only set when the user hasn't.
+if os.environ.get("NCCL_CUMEM_ENABLE") is None:
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
 _SEEN_TP_ALLREDUCE_PATHS: set[
     tuple[str, str, tuple[int, ...], torch.dtype, int]
 ] = set()
@@ -371,6 +381,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
             _trace_all_reduce_path(self, "torch_distributed", input_)
+            return out
+        # SM70/V100 (1Cat-vLLM): raw pynccl wraps ncclAllReduce directly and
+        # does not register its buffers with the CUDA-graph memory pool. During
+        # graph capture, Inductor-planned tensors can trigger an illegal memory
+        # access inside the raw NCCL kernel. Custom-AR (forced above during
+        # capture) is the graph-safe path; if it didn't run and we are still
+        # capturing, fall back to PyTorch's native NCCL backend which supports
+        # capture explicitly.
+        if torch.cuda.is_current_stream_capturing():
+            out = input_.clone()
+            torch.distributed.all_reduce(out, group=self.device_group)
+            _trace_all_reduce_path(self, "torch_distributed_capture", input_)
             return out
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
