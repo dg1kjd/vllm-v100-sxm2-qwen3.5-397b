@@ -274,9 +274,16 @@ MTP speculative-decoding profile (64K context, ~80 tok/s single-stream
 decode, acceptance ~62-73%, ~3.5 tokens per step): the checkpoint ships its
 MTP draft branch in bf16 (12.3 GiB = 1.5 GiB per rank), which does not fit
 next to the KV budget. Quantize the `mtp.*` expert tensors offline to AWQ
-int4 (group size 128, AWQ GEMM layout), keep `mtp.fc` and norms fp16, and
-change `modules_to_not_convert` from `"mtp"` to `"mtp.fc"` in the quant
-config so the loader takes the quantized path (about 0.43 GiB per rank).
+int4 — `tools/quantize_qwen3_5_mtp_awq.py` does exactly this (RTN int4 g128
+in AWQ GEMM layout, `mtp.fc`/norms kept fp16, `modules_to_not_convert`
+flipped from `"mtp"` to `"mtp.fc"` so the loader takes the quantized path;
+about 0.43 GiB per rank, needs only torch/numpy/safetensors):
+
+```bash
+python tools/quantize_qwen3_5_mtp_awq.py \
+  /path/to/Qwen3.5-397B-A17B-AWQ /path/to/Qwen3.5-397B-A17B-AWQ-mtp-int4
+```
+
 Then change these flags relative to the profile above:
 
 ```bash
