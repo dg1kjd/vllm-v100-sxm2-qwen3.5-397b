@@ -25,6 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -103,6 +104,16 @@ def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
         return False
 
 
+# SHARED_GATE_FIRST_v1 (1Cat-vLLM): on fp16, apply the sigmoid expert gate to
+# the intermediate activation instead of the down_proj output. Mathematically
+# identical (per-token scalar; W_d @ (g*a) == g * (W_d @ a)), but down_proj then
+# computes at the final (gated) scale, so its per-rank fp16 partials stay in
+# range. Ungated, a super-weight row (e.g. Qwen3.5-397B ch 3055) reaches
+# |x| ~ 1e5..2e5 > fp16 max and becomes +-inf/-65504 BEFORE the tiny gate
+# (often ~2e-4) can rescale it -> rare flat-logits garbage tokens on SM70.
+SM70_SHARED_GATE_FIRST = os.getenv("VLLM_SM70_SHARED_GATE_FIRST", "1") == "1"
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -154,6 +165,30 @@ class Qwen2MoeMLP(nn.Module):
             )
             out = self.act_fn(gate_up)
         out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
+
+        # SHARED_GATE_FIRST_v1 (see module-level comment): on fp16, fold the
+        # sigmoid expert gate into the activation BEFORE down_proj so down_proj
+        # runs at the gated scale and its fp16 partials stay in range. Identical
+        # math to the gate-after path below; diagnostics preserved.
+        if (
+            self.expert_gate is not None
+            and SM70_SHARED_GATE_FIRST
+            and x.dtype == torch.float16
+        ):
+            expert_gate = self.expert_gate(x)[0]
+            expert_gate = _sm70_dump_qwen_mlp_tensor(
+                "mlp_expert_gate", self.layer_idx, expert_gate
+            )
+            expert_gate = F.sigmoid(expert_gate)
+            expert_gate = _sm70_dump_qwen_mlp_tensor(
+                "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
+            )
+            out = expert_gate * out
+            out, _ = self.down_proj(out)
+            out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
+            return out
+        # END SHARED_GATE_FIRST_v1
+
         out, _ = self.down_proj(out)
         out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
 
