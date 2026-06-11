@@ -233,8 +233,11 @@ export VLLM_SM70_GDN_DELTA_H_BV=16 VLLM_SM70_GDN_DELTA_H_WARPS=4 VLLM_SM70_GDN_D
 export VLLM_SM70_GDN_CHUNK_O_BK=64 VLLM_SM70_GDN_CHUNK_O_BV=64 VLLM_SM70_GDN_CHUNK_O_WARPS=8 VLLM_SM70_GDN_CHUNK_O_STAGES=2
 # optional, trims NCCL buffer memory on 8-GPU boards:
 export NCCL_MAX_NCHANNELS=2 NCCL_MIN_NCHANNELS=1 NCCL_BUFFSIZE=1048576
-export PYTORCH_ALLOC_CONF=expandable_segments:True
 ```
+
+Do not enable the allocator's `expandable_segments` option
+(`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`): it breaks custom
+all-reduce CUDA graph capture on this TP8 profile.
 
 Long-context profile (110K context, ~50 tok/s single-stream decode,
 ~100 tok/s aggregate at 4 streams, prefill 1.7-3.6K tok/s):
