@@ -897,6 +897,17 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        logger.warning_once(
+                            "Request %s cannot be scheduled: the mamba "
+                            "block-aligned split truncated its prefill chunk "
+                            "to 0 tokens (token budget %d < block size %d). "
+                            "If this repeats every step, the request is stuck "
+                            "forever; raise --max-num-batched-tokens to at "
+                            "least the block size.",
+                            request.request_id,
+                            token_budget,
+                            self.cache_config.block_size,
+                        )
                         break
 
                 # Handles an edge case when P/D Disaggregation
