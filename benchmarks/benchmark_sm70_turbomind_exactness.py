@@ -1163,7 +1163,7 @@ def _check_awq_moe(
                 compact_ptrs_w2_s,
                 single_token_offsets,
                 single_token_inv_permuted_idx,
-                int(w13_legacy_tm_weight.shape[1]),
+                int(w13_tm_weight.shape[1]),
                 w13_n,
                 int(w2_tm_weight.shape[1]),
                 hidden_out,

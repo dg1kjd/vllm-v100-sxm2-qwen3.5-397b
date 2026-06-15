@@ -93,6 +93,8 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
 #if !defined(USE_ROCM) && defined(ENABLE_SM70_TURBOMIND)
+void silu_and_mul_interleaved(torch::Tensor& out, torch::Tensor& input);
+
 std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             torch::Tensor _scaling_factors,
                                             torch::Tensor _zeros,

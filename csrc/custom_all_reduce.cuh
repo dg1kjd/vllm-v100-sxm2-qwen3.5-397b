@@ -193,10 +193,27 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
   return flag;
 }
 
+static DINLINE void st_flag_sys_visible(FlagType* flag_addr, FlagType flag) {
+  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;"
+               ::"r"(flag),
+               "l"(flag_addr)
+               : "memory");
+}
+
+static DINLINE FlagType ld_flag_sys_visible(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.volatile.global.u32 %0, [%1]; membar.sys;"
+               : "=r"(flag)
+               : "l"(flag_addr)
+               : "memory");
+  return flag;
+}
+
 // This function is meant to be used as the first synchronization in the all
-// reduce kernel. Thus, it doesn't need to make any visibility guarantees for
-// prior memory accesses. Note: volatile writes will not be reordered against
-// other volatile writes.
+// reduce kernel. The all-reduce input is usually produced by kernels launched
+// immediately before this kernel on each rank. Use a system memory fence around
+// the peer-visible flag so faster upstream paths do not expose stale input to
+// peer ranks.
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
@@ -206,8 +223,8 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     auto self_counter_ptr = &self_sg->start[blockIdx.x][threadIdx.x];
     // Write the expected counter value to peer and wait for correct value
     // from peer.
-    st_flag_volatile(peer_counter_ptr, flag);
-    while (ld_flag_volatile(self_counter_ptr) != flag);
+    st_flag_sys_visible(peer_counter_ptr, flag);
+    while (ld_flag_sys_visible(self_counter_ptr) != flag);
   }
   __syncthreads();
   // use one thread to update flag

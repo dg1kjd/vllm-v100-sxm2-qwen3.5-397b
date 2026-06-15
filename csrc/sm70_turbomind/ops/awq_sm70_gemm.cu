@@ -80,6 +80,43 @@ void sm70_silu_and_mul_fp16_out(torch::Tensor out, torch::Tensor input) {
       out_stride);
 }
 
+__global__ void sm70_silu_and_mul_interleaved_fp16_kernel(__half* out,
+                                                          const __half* input,
+                                                          int rows,
+                                                          int d,
+                                                          int input_stride,
+                                                          int out_stride) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const __half* row_in = input + row * input_stride;
+  __half* row_out = out + row * out_stride;
+  for (int col = threadIdx.x; col < d; col += blockDim.x) {
+    const int gate_col = col * 2;
+    const float gate_f = __half2float(row_in[gate_col]);
+    const __half silu = __float2half(gate_f / (1.0f + expf(-gate_f)));
+    row_out[col] = __hmul(silu, row_in[gate_col + 1]);
+  }
+}
+
+void sm70_silu_and_mul_interleaved_fp16_out(torch::Tensor out,
+                                            torch::Tensor input) {
+  const int rows = static_cast<int>(out.size(0));
+  const int d = static_cast<int>(out.size(1));
+  const int input_stride = static_cast<int>(input.stride(0));
+  const int out_stride = static_cast<int>(out.stride(0));
+  constexpr int kThreads = 256;
+  sm70_silu_and_mul_interleaved_fp16_kernel<<<
+      rows, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+      rows,
+      d,
+      input_stride,
+      out_stride);
+}
+
 bool sm70_profile_trace_enabled() {
   const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
   return value != nullptr && std::strcmp(value, "1") == 0;
@@ -162,6 +199,23 @@ void silu_and_mul(torch::Tensor& out, torch::Tensor& input) {
               "silu_and_mul output shape must be half of input last dim.");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   sm70_silu_and_mul_fp16_out(out, input);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void silu_and_mul_interleaved(torch::Tensor& out, torch::Tensor& input) {
+  TORCH_CHECK(input.is_cuda() && out.is_cuda(),
+              "silu_and_mul_interleaved SM70 op expects CUDA tensors.");
+  TORCH_CHECK(input.scalar_type() == at::ScalarType::Half &&
+                  out.scalar_type() == at::ScalarType::Half,
+              "silu_and_mul_interleaved only supports float16.");
+  TORCH_CHECK(input.dim() >= 1,
+              "silu_and_mul_interleaved expects input rank >= 1.");
+  TORCH_CHECK(input.size(-1) == out.size(-1) * 2,
+              "silu_and_mul_interleaved input last dim must be twice output.");
+  TORCH_CHECK(input.numel() == out.numel() * 2,
+              "silu_and_mul_interleaved batch shape mismatch.");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  sm70_silu_and_mul_interleaved_fp16_out(out, input);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

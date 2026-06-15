@@ -29,6 +29,20 @@ def _op(name: str):
     return getattr(torch.ops._C, name)
 
 
+def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
+    _op("silu_and_mul_interleaved")(out, input)
+
+
+if hasattr(torch.ops._C, "silu_and_mul_interleaved"):
+
+    @register_fake("_C::silu_and_mul_interleaved")
+    def _silu_and_mul_interleaved_fake(
+        out: torch.Tensor, input: torch.Tensor
+    ) -> None:
+        del out, input
+        return None
+
+
 def awq_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,

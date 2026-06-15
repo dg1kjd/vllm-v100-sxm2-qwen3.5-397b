@@ -67,6 +67,15 @@ def _save_lut_cache(device: torch.device) -> int:
         return 0
 
 
+def _silu_and_mul_w13(
+    layer: torch.nn.Module, out: torch.Tensor, gate_up: torch.Tensor
+) -> None:
+    if getattr(layer, "sm70_awq_moe_w13_interleaved", False):
+        sm70_ops.silu_and_mul_interleaved(out, gate_up)
+    else:
+        torch.ops._C.silu_and_mul(out, gate_up)
+
+
 def _spec_decode_query_len(worker: Worker) -> int:
     spec_config = worker.vllm_config.speculative_config
     if spec_config is None:
@@ -313,7 +322,7 @@ def _warmup_moe_dense_stage_layers(
                 int(layer.sm70_w13_n_dim),
                 group_size,
             )
-            torch.ops._C.silu_and_mul(intermediate, gate_up)
+            _silu_and_mul_w13(layer, intermediate, gate_up)
             sm70_ops.awq_moe_dense_stage_sm70_out(
                 sorted_output,
                 intermediate,
@@ -393,7 +402,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
             group_size,
             hidden_size,
         )
-        torch.ops._C.silu_and_mul(intermediate, gate_up)
+        _silu_and_mul_w13(layer, intermediate, gate_up)
         sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
             sorted_output,
             intermediate,
@@ -411,7 +420,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
         if (
             envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT
             and hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
-            and hasattr(layer, "w13_legacy_strided_ptrs_w_rows")
+            and getattr(layer, "sm70_awq_moe_legacy_single_token_compact", False)
             and hasattr(layer, "w2_strided_ptrs_w_rows")
         ):
             topk_weights = torch.empty(top_k, dtype=torch.float32, device=device)
@@ -440,8 +449,8 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
                 x,
                 topk_weights,
                 topk_ids,
-                layer.w13_legacy_strided_ptrs_w_rows,
-                layer.w13_legacy_strided_ptrs_s_rows,
+                layer.w13_strided_ptrs_w_rows,
+                layer.w13_strided_ptrs_s_rows,
                 layer.w2_strided_ptrs_w_rows,
                 layer.w2_strided_ptrs_s_rows,
                 compact_input,

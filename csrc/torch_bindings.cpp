@@ -151,6 +151,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // conditionally compiled so impl registrations are in source file
 
 #ifdef ENABLE_SM70_TURBOMIND
+  ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
+  ops.impl("silu_and_mul_interleaved", torch::kCUDA,
+           &silu_and_mul_interleaved);
+
   ops.def(
       "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor _zeros, "
       "int group_size, bool interleave_gated_silu) -> Tensor[]");

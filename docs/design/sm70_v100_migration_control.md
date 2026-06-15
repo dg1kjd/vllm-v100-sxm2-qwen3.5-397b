@@ -29854,7 +29854,192 @@ evidence before they can count as accepted/default.
        knobs.
      - The failure is not evidence for the old top-k descriptor compact; this
        candidate is the current exact-layout active source-group compact route.
-     - The next useful debug is not another end-to-end rerun. Instrument the
-       compact-only run with compact compare / layer-local dumps under the same
-       pins (`packed=0`, `fp8_tune=0`) and locate the first layer/step where
-       exact-layout compact diverges from the non-compact MoE output.
+     - The previously accepted post-smem-fix compact artifacts are not the same
+       acceptance口径: they used vLLM `0.21.1rc1.dev438+g4ff865c38.d20260613`,
+       FP8 KV `fp8_e5m2`, `max_num_batched_tokens=4096`,
+       `gpu_memory_utilization=0.88`, `trust_remote_code=true`, and left
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES` unset. The current failing/default
+       candidate uses vLLM `0.21.1rc1.dev439+gee0bc6a87.d20260614`, FP8 KV
+       `fp8_e4m3`, `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0`,
+       `max_num_batched_tokens` default, `gpu_memory_utilization=0.95`, and
+       `trust_remote_code=false`. Therefore the old pass is valid for its
+       route, but it did not prove the current e4m3/tune0 default candidate.
+     - Current e4m3/tune0/packed0 eager compact compare:
+       `bench_results/fp8_compact_only_quality_20260615/compact_compare_eager_i4096_o64/run.log`.
+       It reported `5120` compact-vs-noncompact local MoE reports with
+       `perm=0`, `off_eq=True`, `off64_eq=True`, `inv_eq=True`, and
+       `w13/silu/w2/out=0`. This says the exact-layout compact arithmetic is
+       locally exact in eager; it does not prove production graph replay.
+     - Production graph isolation:
+       `bench_results/fp8_compact_only_quality_20260615/compact_native_unpermute_graph_i4096_o64/tokens.json`
+       and
+       `bench_results/fp8_compact_only_quality_20260615/compact_decomposed_graph_i4096_o64/tokens.json`
+       both still diverged from all-off at output index `52` (`364` -> `440`).
+       This rules out the final weighted-reduce/native-unpermute choice and the
+       monolithic custom out-op wrapper as the sole cause. The remaining suspect
+       is the production graph interaction with the exact-layout compact
+       metadata/offset path under the current e4m3/tune0口径, or a very small
+       logits-margin flip that requires sampler-logit/common-prefix evidence.
+     - `logprobs=5` is not a valid strict-token reproducer for this case: the
+       all-off `logprobs=5` run and compact `logprobs=5` run diverged at token
+       index `3`, so requesting logprobs changes the generation path enough that
+       it cannot be used to explain the original pure greedy index-52 split.
+     - Current code with the old-like KV/trust口径 was tested directly:
+       `--kv-cache-dtype fp8_e5m2`, `--trust-remote-code`,
+       `max_num_batched_tokens=4096`, `gpu_memory_utilization=0.88`, and
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES` unset. All-off:
+       `bench_results/fp8_compact_only_quality_20260615/e5m2_trust_true_alloff_i4096_o64/tokens.json`;
+       compact-only:
+       `bench_results/fp8_compact_only_quality_20260615/e5m2_trust_true_compact_i4096_o64/tokens.json`.
+       Result: `equal=false`, first mismatch at output index `44`: all-off
+       token `1965`, compact-only token `3074`. The progress-bar output speed
+       (`60.56`/`64.26 tok/s`) is not the accepted pure decode口径 for this
+       short 64-token probe because it includes first-token/prefill effects.
+       The JSON request metrics show `steady_decode_tps=107.563 tok/s`
+       all-off and `117.604 tok/s` compact-only. This means the current
+       compact-only drift is not explained solely by e4m3 KV cache or
+       `trust_remote_code=false`, while the compact speed advantage is still
+       present in this short probe.
+     - A production-graph dump attempt with graph-buffer copies around output
+       steps `44,45` was not a valid divergence localizer because it masked the
+       bug: all-off
+       `bench_results/fp8_compact_only_quality_20260615/layerdump_e5m2_alloff_o46/tokens.json`
+       and compact
+       `bench_results/fp8_compact_only_quality_20260615/layerdump_e5m2_compact_o46/tokens.json`
+       were token-equal for 46 outputs, and the all-off dump matched the
+       previous all-off prefix. The compact dump changed the candidate back to
+       the all-off token at index `44`, so the dump custom ops alter graph
+       partition/lifetime enough to hide the failure.
+     - A narrower diagnostic that inserted only `output.add_(0.0)` after the
+       compact op did not fix the split:
+       `bench_results/fp8_compact_only_quality_20260615/e5m2_trust_true_compact_barrier_i4096_o46/tokens.json`
+       still diverged from the all-off prefix at output index `44`
+       (`3074` vs `1965`) and recorded `steady_decode_tps=116.497 tok/s`.
+       Therefore the issue is not a trivial final-output read-after-write
+       dependency after `fp8_moe_single_token_sm70_out`; the dump masking points
+       instead to compile/full-graph partitioning or an upstream intermediate
+       lifetime/metadata interaction.
+     - The next useful debug is not another 1024-token end-to-end rerun. First
+       use a less intrusive graph/compile localizer: isolate which single dump
+       label or graph break masks the index-44 split, then inspect that boundary
+       with a minimal side-effect. The eager local MoE proof is still all-zero,
+       so the likely gap is graph replay-visible state/metadata use,
+       cross-layer propagation, or a compile partition/lifetime issue, not the
+       standalone exact-layout GEMM arithmetic.
+
+399. 2026-06-15 FP8 exact-layout compact drift root-caused to SM70 custom
+     all-reduce start-barrier visibility; conservative fix passes 4K/1024.
+
+     Data-driven isolation:
+     - The same formal e4m3/tune0/packed0口径 from item 398 was kept fixed:
+       Qwen3.6-35B-A3B-FP8, physical GPUs `0,1`, TP2, `input_len=4096`,
+       greedy, FP8 KV `fp8_e4m3`, production Flash-V100 compile graph,
+       native FP8 TurboMind MoE, and exact-layout compact enabled.
+     - Old failing compact artifact:
+       `bench_results/fp8_compact_only_quality_20260615/compact_funcfix_i4096_o1024_tp2_tune0/tokens.json`
+       was token-identical to the pre-fix compact artifact for 1024 tokens and
+       still split from all-off at output index `52`: compact token `440`,
+       all-off token `364`, `steady_decode_tps=104.358`.
+     - Single-variable communication isolation:
+       `bench_results/fp8_compact_only_quality_20260615/compact_funcfix_i4096_o64_tp2_tune0_disable_custom_ar/tokens.json`
+       kept compact enabled but set `--disable-custom-all-reduce`. It matched
+       the all-off 1024 reference for the first `64` output tokens, including
+       the old split point, and differed from the failing compact at index `52`
+       (`364` vs `440`). It recorded `steady_decode_tps=93.980`, so disabling
+       custom all-reduce proves the root-cause class but is not an acceptable
+       production speed fix.
+     - A sampler-side no-op/delay probe also supported a timing/race class:
+       compact with the top-k dump env present but enable-file absent changed
+       to a third sequence at output index `46`, while all-off with the same
+       delay remained prefix-stable for `64` outputs. This rules out a global
+       baseline instability and points to compact exposing a custom all-reduce
+       visibility assumption.
+
+     Fix:
+     - `csrc/custom_all_reduce.cuh` start barrier now uses
+       `membar.sys` around the peer-visible start flag (`st.volatile` /
+       `ld.volatile`) instead of the previous no-visibility volatile-only
+       barrier. The previous comment said the first barrier did not need
+       visibility guarantees for prior memory accesses; that assumption is
+       false for graph replay when the all-reduce input is produced by the
+       immediately preceding compact/MLP kernels and then read through peer
+       memory.
+     - A direct `st.release.sys` / `ld.acquire.sys` start-barrier attempt was
+       rejected: it compiled but caused a worker `-11` during graph capture on
+       V100. A lower-overhead "one membar before/after the wait loop" attempt
+       was also rejected after a process `Bus error` at startup. The accepted
+       patch is the conservative per-flag `membar.sys + volatile` variant that
+       has full-model evidence below.
+
+     Accepted evidence:
+     - Fixed compact artifact:
+       `bench_results/fp8_compact_only_quality_20260615/compact_membar_i4096_o1024_tp2_tune0/tokens.json`.
+     - Reference:
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o1024_tp2_r2/tokens.json`.
+     - Result: fixed compact vs all-off is exactly equal for `1024/1024`
+       output tokens. The fixed compact differs from the old failing compact at
+       output index `52` as expected: fixed/all-off token `364`, old compact
+       token `440`.
+     - Speed in the same 4K/1024口径:
+       all-off `97.484 tok/s`, old incorrect compact `104.508 tok/s`, fixed
+       compact `100.790 tok/s`. The fix keeps custom all-reduce enabled
+       (`custom_all_reduce_enabled_effective=true`,
+       `disable_custom_all_reduce=false`) and keeps exact-layout compact
+       enabled; it does not fall back to the no-custom-all-reduce speed lane.
+       The remaining ~3.7 tok/s gap to the old incorrect compact is the cost of
+       the conservative visibility fence and is a separate optimization target,
+       not a reason to reopen compact arithmetic.
+
+400. 2026-06-15 35B-AWQ W13 memory-reclaim path recovered without token drift
+     against the current reproducible quality baseline.
+
+     Baseline clarification:
+     - The earlier 10:15 artifact
+       `bench_results/quality_pass_speed_20260615/decode_qwen36_35b_awq_default_fast_i4096_o1024_tp2_w1_r2_20260615.json`
+       records hash
+       `bc0942f06705ec25d5a083f98062abcdcae789ff42d83ec7ad7d560ffdddda92`
+       and `steady_decode_tps=106.650`, but that exact token stream did not
+       reproduce after restoring clean release runtime sources and rebuilding
+       `_C`.
+     - Clean release-runtime rerun:
+       `bench_results/memory_reclaim_20260615/decode_qwen36_35b_awq_clean_head_runtime_i4096_o1024_tp2_w1_r2_20260615.json`.
+       Same model, TP2 GPUs `2,3`, `input_len=4096`, `output_len=1024`,
+       `max_model_len=8192`, Flash-V100 0.0.3 compile graph, custom
+       all-reduce enabled, and greedy sampling. It produced stable hash
+       `da447c2c5e07fd14361dc350c2bda169aa7b2fee48c3c118fa06bb19b73077d6`
+       for warmup and both repeats. It first differs from the 10:15 artifact at
+       output index `3` (`198` -> `271`) while keeping the speed lane intact:
+       `steady_decode_tps=110.387`, load memory `16.22 GiB`, available KV
+       `10.88 GiB`, KV cache `804,305` tokens.
+     - Therefore `bc0942...` is not a currently reproducible oracle for judging
+       this W13 memory-reclaim change. The accepted comparison for this patch is
+       the same-run clean duplicate-W13 baseline above.
+
+     Fix:
+     - AWQ MoE W13 is now stored once in the gated/up interleaved TurboMind
+       layout when the legacy single-token compact path is enabled. The legacy
+       compact op reuses the main `w13_strided_ptrs_*_rows` instead of keeping
+       separate `w13_legacy_tm_weight/scales` and separate legacy strided
+       pointer parameters.
+     - Batched and strict W13 paths now route their post-W13 activation through
+       a layout-aware helper. Interleaved W13 uses the new
+       `_C::silu_and_mul_interleaved` op; non-interleaved fallback keeps the
+       existing `_C::silu_and_mul`.
+     - Warmup uses the same layout-aware SiLU helper and warms the legacy compact
+       route with the shared W13 pointer rows, so graph capture and production
+       execution see the same layout.
+
+     Accepted evidence:
+     - Memory-reclaim artifact:
+       `bench_results/memory_reclaim_20260615/decode_qwen36_35b_awq_single_interleaved_w13_rebuilt_i4096_o1024_tp2_w1_r2_20260615.json`.
+     - Result: memory-reclaim vs clean duplicate-W13 baseline is token-identical
+       for `1024/1024` output tokens; `first_diff=None`; hash remains
+       `da447c2c5e07fd14361dc350c2bda169aa7b2fee48c3c118fa06bb19b73077d6`
+       for warmup and both repeats.
+     - Speed/memory in the same 4K/1024口径:
+       clean duplicate-W13 `steady_decode_tps=110.387`, output `105.645`,
+       load memory `16.22 GiB`, available KV `10.88 GiB`, KV cache `804,305`.
+       single-W13 memory-reclaim `steady_decode_tps=110.302`, output
+       `105.572`, load memory `11.04 GiB`, available KV `16.06 GiB`, KV cache
+       `1,187,095`. This recovers about `5.18 GiB` per GPU for KV/cache use
+       while preserving the 110 tok/s decode lane and token output.

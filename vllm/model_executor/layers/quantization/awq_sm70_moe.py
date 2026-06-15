@@ -84,6 +84,15 @@ def _legacy_single_token_compact_enabled() -> bool:
     return hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
 
 
+def _silu_and_mul_w13(
+    layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
+) -> None:
+    if getattr(layer, "sm70_awq_moe_w13_interleaved", False):
+        sm70_ops.silu_and_mul_interleaved(out, gate_up)
+    else:
+        torch.ops._C.silu_and_mul(out, gate_up)
+
+
 def _parse_layer_id_filter(raw: str | None, env_name: str) -> set[int] | None:
     if raw is None:
         return None
@@ -553,35 +562,27 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
 
         num_experts = int(layer.w13_qweight.shape[0])
         w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
-        w13_legacy_tm_weights, w13_legacy_tm_scales, w13_legacy_meta = [], [], []
         w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
         build_legacy_w13 = (
             batched_gemm
             and envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT
             and hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
         )
+        # Use one interleaved W13 layout for both batched W13 and the legacy
+        # single-token compact op. This keeps the compact speed path without
+        # carrying a second per-expert W13 TurboMind copy.
+        w13_interleaved = build_legacy_w13
         for expert_id in range(num_experts):
             r13 = sm70_ops.awq_sm70_prepare(
                 layer.w13_qweight[expert_id],
                 layer.w13_scales[expert_id],
                 layer.w13_qzeros[expert_id],
                 self.group_size,
-                False,
+                w13_interleaved,
             )
             w13_tm_weights.append(r13[0])
             w13_tm_scales.append(r13[1])
             w13_meta.append(r13[2])
-            if build_legacy_w13:
-                r13_legacy = sm70_ops.awq_sm70_prepare(
-                    layer.w13_qweight[expert_id],
-                    layer.w13_scales[expert_id],
-                    layer.w13_qzeros[expert_id],
-                    self.group_size,
-                    True,
-                )
-                w13_legacy_tm_weights.append(r13_legacy[0])
-                w13_legacy_tm_scales.append(r13_legacy[1])
-                w13_legacy_meta.append(r13_legacy[2])
 
             r2 = sm70_ops.awq_sm70_prepare(
                 layer.w2_qweight[expert_id],
@@ -600,20 +601,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.w13_tm_scales = Parameter(
             torch.stack(w13_tm_scales), requires_grad=False
         )
-        if build_legacy_w13:
-            layer.w13_legacy_tm_weight = Parameter(
-                torch.stack(w13_legacy_tm_weights), requires_grad=False
-            )
-            layer.w13_legacy_tm_scales = Parameter(
-                torch.stack(w13_legacy_tm_scales), requires_grad=False
-            )
         layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
         layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
 
         w13_k_ld, w13_q_ld = int(w13_meta[0][0].item()), int(w13_meta[0][1].item())
-        if build_legacy_w13:
-            w13_legacy_k_ld = int(w13_legacy_meta[0][0].item())
-            w13_legacy_q_ld = int(w13_legacy_meta[0][1].item())
         w2_k_ld, w2_q_ld = int(w2_meta[0][0].item()), int(w2_meta[0][1].item())
         w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
@@ -622,14 +613,6 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             w13_q_ld,
             num_experts,
         )
-        if build_legacy_w13:
-            w13_legacy_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
-                layer.w13_legacy_tm_weight,
-                layer.w13_legacy_tm_scales,
-                w13_legacy_k_ld,
-                w13_legacy_q_ld,
-                num_experts,
-            )
         w2_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
             layer.w2_tm_weight,
             layer.w2_tm_scales,
@@ -639,13 +622,6 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_strided_ptrs_w = Parameter(w13_ptrs[0], requires_grad=False)
         layer.w13_strided_ptrs_s = Parameter(w13_ptrs[1], requires_grad=False)
-        if build_legacy_w13:
-            layer.w13_legacy_strided_ptrs_w = Parameter(
-                w13_legacy_ptrs[0], requires_grad=False
-            )
-            layer.w13_legacy_strided_ptrs_s = Parameter(
-                w13_legacy_ptrs[1], requires_grad=False
-            )
         layer.w2_strided_ptrs_w = Parameter(w2_ptrs[0], requires_grad=False)
         layer.w2_strided_ptrs_s = Parameter(w2_ptrs[1], requires_grad=False)
         ptr_row_bytes = int(layer.w13_strided_ptrs_w.numel() // num_experts)
@@ -657,12 +633,8 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             num_experts, ptr_row_bytes
         )
         if build_legacy_w13:
-            layer.w13_legacy_strided_ptrs_w_rows = (
-                layer.w13_legacy_strided_ptrs_w.view(num_experts, ptr_row_bytes)
-            )
-            layer.w13_legacy_strided_ptrs_s_rows = (
-                layer.w13_legacy_strided_ptrs_s.view(num_experts, ptr_row_bytes)
-            )
+            layer.w13_legacy_strided_ptrs_w_rows = layer.w13_strided_ptrs_w_rows
+            layer.w13_legacy_strided_ptrs_s_rows = layer.w13_strided_ptrs_s_rows
         layer.w2_strided_ptrs_w_rows = layer.w2_strided_ptrs_w.view(
             num_experts, ptr_row_bytes
         )
@@ -682,6 +654,8 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_intermediate_size = layer.sm70_w2_k_dim
         layer.sm70_awq_moe_batched_gemm = batched_gemm
         layer.sm70_awq_moe_layer_id = _get_layer_id(layer)
+        layer.sm70_awq_moe_w13_interleaved = w13_interleaved
+        layer.sm70_awq_moe_legacy_single_token_compact = build_legacy_w13
 
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
@@ -1060,7 +1034,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             num_tokens == 1
             and layer.sm70_awq_moe_batched_gemm
             and _legacy_single_token_compact_enabled()
-            and hasattr(layer, "w13_legacy_strided_ptrs_w_rows")
+            and layer.sm70_awq_moe_legacy_single_token_compact
         ):
             return self._apply_legacy_single_token_compact(
                 layer, x, topk_weights, topk_ids_i32, buffers, top_k, output
@@ -1190,7 +1164,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             buffers["gate_up"] = _dump_awq_moe_buffer(
                 layer, buffers["gate_up"], "st_w13_out"
             )
-            torch.ops._C.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
+            _silu_and_mul_w13(layer, buffers["intermediate"], buffers["gate_up"])
             buffers["intermediate"] = _dump_awq_moe_buffer(
                 layer, buffers["intermediate"], "st_silu_out"
             )
@@ -1400,7 +1374,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             buffers["gate_up"] = _dump_awq_moe_buffer(
                 layer, buffers["gate_up"], "w13_dense_out"
             )
-        torch.ops._C.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
+        _silu_and_mul_w13(layer, buffers["intermediate"], buffers["gate_up"])
         buffers["intermediate"] = _dump_awq_moe_buffer(
             layer, buffers["intermediate"], "silu_out"
         )
@@ -1461,7 +1435,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     dense_full_sorted_output = torch.empty_like(
                         buffers["sorted_output"]
                     )
-                    torch.ops._C.silu_and_mul(dense_intermediate, dense_gate_up)
+                    _silu_and_mul_w13(layer, dense_intermediate, dense_gate_up)
                     sm70_ops.awq_moe_dense_stage_sm70_out(
                         dense_full_sorted_output,
                         dense_intermediate,
@@ -1547,7 +1521,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 dense_full_sorted_output = torch.empty_like(buffers["sorted_output"])
                 compare_dense_full_output = torch.empty_like(output)
                 compare_dense_full_output.zero_()
-                torch.ops._C.silu_and_mul(dense_intermediate, dense_gate_up)
+                _silu_and_mul_w13(layer, dense_intermediate, dense_gate_up)
                 sm70_ops.awq_moe_dense_stage_sm70_out(
                     dense_full_sorted_output,
                     dense_intermediate,
@@ -1607,7 +1581,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                         self.group_size,
                         layer.sm70_hidden_logical_size,
                     )
-                    torch.ops._C.silu_and_mul(strict_intermediate, strict_gate_up)
+                    _silu_and_mul_w13(layer, strict_intermediate, strict_gate_up)
                     sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
                         strict_sorted_output,
                         strict_intermediate,
