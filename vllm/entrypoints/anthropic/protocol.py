@@ -65,7 +65,11 @@ class AnthropicContentBlock(BaseModel):
 class AnthropicMessage(BaseModel):
     """Message structure"""
 
-    role: Literal["user", "assistant"]
+    # SYSROLE_v1 (1Cat-vLLM): official Anthropic API allows only user/assistant
+    # here, but lenient gateways (llama.cpp) accept "system" in messages and
+    # Claude Code relies on that when pointed at a custom base URL; the converted
+    # message list is OpenAI-format downstream where a system role is legal.
+    role: Literal["user", "assistant", "system"]
     content: str | list[AnthropicContentBlock]
 
 

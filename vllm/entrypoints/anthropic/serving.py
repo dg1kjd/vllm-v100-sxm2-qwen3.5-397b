@@ -167,7 +167,15 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> None:
         """Convert Anthropic messages to OpenAI format"""
         for msg in messages:
-            openai_msg: dict[str, Any] = {"role": msg.role}  # type: ignore
+            # SYSROLE_v1 (1Cat-vLLM): the model chat template only accepts a
+            # leading system message; demote mid-conversation system messages
+            # (Claude Code sends them to custom gateways) to user role.
+            role = msg.role
+            if role == "system" and any(
+                m["role"] != "system" for m in openai_messages
+            ):
+                role = "user"
+            openai_msg: dict[str, Any] = {"role": role}  # type: ignore
 
             if isinstance(msg.content, str):
                 openai_msg["content"] = msg.content
