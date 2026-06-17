@@ -15,9 +15,17 @@ def register_instrumentator_api_routers(app: FastAPI):
 
     app.include_router(health_router)
 
-    from .metrics import attach_router as metrics_attach_router
+    # Prometheus instrumentator DISABLED by default (1Cat-vLLM): its per-request
+    # middleware iterates app.routes and reads route.path, raising
+    # "'_IncludedRouter' object has no attribute 'path'" on starlette 1.x and
+    # 500-ing every request. The /metrics scrape isn't used on this deployment.
+    # Re-enable with VLLM_ENABLE_PROMETHEUS=1 if ever needed.
+    import os
 
-    metrics_attach_router(app)
+    if os.getenv("VLLM_ENABLE_PROMETHEUS", "0") == "1":
+        from .metrics import attach_router as metrics_attach_router
+
+        metrics_attach_router(app)
 
     from .offline_docs import attach_router as offline_docs_attach_router
 
