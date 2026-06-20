@@ -16,7 +16,7 @@ from shutil import which
 
 import torch
 from packaging.version import Version, parse
-from setuptools import Extension, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_rust import Binding, RustExtension
 from setuptools_rust.build import build_rust
@@ -36,6 +36,22 @@ ROOT_DIR = Path(__file__).parent
 logger = logging.getLogger(__name__)
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
+FLASH_ATTN_V100_ROOT = ROOT_DIR / "flash-attention-v100"
+FLASH_ATTN_V100_PACKAGE = FLASH_ATTN_V100_ROOT / "flash_attn_v100"
+ONECAT_TORCH_CU128_URLS = {
+    "torch==2.10.0": (
+        "torch @ https://download.pytorch.org/whl/cu128/"
+        "torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
+    ),
+    "torchaudio==2.10.0": (
+        "torchaudio @ https://download.pytorch.org/whl/cu128/"
+        "torchaudio-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
+    ),
+    "torchvision==0.25.0": (
+        "torchvision @ https://download.pytorch.org/whl/cu128/"
+        "torchvision-0.25.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
+    ),
+}
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
@@ -155,6 +171,36 @@ def bundle_tcmalloc(build_lib: str) -> None:
     bundle_path = os.path.join(bundle_dir, tcmalloc_library.name)
     shutil.copy2(tcmalloc_library, bundle_path)
     logger.info("Bundled tcmalloc into wheel: %s", bundle_path)
+
+
+def bundle_flash_attn_v100(build_lib: str) -> None:
+    """Build and embed the SM70 Flash-V100 package into the 1Cat wheel."""
+    if not FLASH_ATTN_V100_ROOT.exists():
+        logger.warning("Flash-V100 source tree is missing; skipping wheel bundle")
+        return
+
+    env = os.environ.copy()
+    env.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
+    subprocess.check_call(
+        [sys.executable, "setup.py", "build_ext", "--inplace"],
+        cwd=FLASH_ATTN_V100_ROOT,
+        env=env,
+    )
+
+    dst_pkg = Path(build_lib) / "flash_attn_v100"
+    dst_pkg.mkdir(parents=True, exist_ok=True)
+
+    for py_file in FLASH_ATTN_V100_PACKAGE.glob("*.py"):
+        shutil.copy2(py_file, dst_pkg / py_file.name)
+
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    for ext_name in ("flash_attn_v100_cuda", "paged_kv_utils"):
+        matches = sorted(FLASH_ATTN_V100_ROOT.glob(f"{ext_name}*{ext_suffix}"))
+        if not matches:
+            matches = sorted(FLASH_ATTN_V100_ROOT.glob(f"{ext_name}*.so"))
+        if not matches:
+            raise RuntimeError(f"Failed to build Flash-V100 extension: {ext_name}")
+        shutil.copy2(matches[-1], dst_pkg / matches[-1].name)
 
 
 class CMakeExtension(Extension):
@@ -363,6 +409,9 @@ class cmake_build_ext(build_ext):
         # bundle tcmalloc into CPU wheels for best OOB perf
         if should_bundle_tcmalloc():
             bundle_tcmalloc(self.build_lib)
+
+        if _is_cuda():
+            bundle_flash_attn_v100(self.build_lib)
 
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
         # directory so that they can be included in the editable build
@@ -1045,6 +1094,8 @@ def get_requirements() -> list[str]:
         cuda_major, cuda_minor = torch.version.cuda.split(".")
         modified_requirements = []
         for req in requirements:
+            if bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))):
+                req = ONECAT_TORCH_CU128_URLS.get(req.split("#", 1)[0].strip(), req)
             if "vllm-flash-attn" in req and cuda_major != "12":
                 # vllm-flash-attn is built only for CUDA 12.x.
                 # Skip for other versions.
@@ -1143,6 +1194,9 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
 
 package_data = {
+    "flash_attn_v100": [
+        "*.so",
+    ],
     "vllm": [
         "py.typed",
         "libs/*.so*",
@@ -1210,6 +1264,10 @@ rust_extensions = [
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
+    packages=find_packages(include=["vllm*"]) + ["flash_attn_v100"],
+    package_dir={
+        "flash_attn_v100": str(FLASH_ATTN_V100_PACKAGE),
+    },
     ext_modules=ext_modules,
     rust_extensions=rust_extensions,
     install_requires=get_requirements(),

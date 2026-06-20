@@ -1,4 +1,4 @@
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 from flash_attn_v100.flash_attn_interface import (
     flash_attn_decode_qk_scores,

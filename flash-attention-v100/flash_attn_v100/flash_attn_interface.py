@@ -1,7 +1,10 @@
 import torch
 import traceback
 import os
-import flash_attn_v100_cuda
+try:
+    import flash_attn_v100_cuda
+except ImportError:
+    from . import flash_attn_v100_cuda
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Union
 

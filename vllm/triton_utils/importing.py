@@ -3,13 +3,21 @@
 
 import os
 import types
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+
+
+def _vllm_distribution_version() -> str:
+    try:
+        return version("vllm")
+    except PackageNotFoundError:
+        return version("1cat-vllm")
+
 
 HAS_TRITON = (
     find_spec("triton") is not None
@@ -51,7 +59,7 @@ if HAS_TRITON:
             HAS_TRITON = False
 
         # Check Triton CPU
-        if "cpu" in version("vllm"):
+        if "cpu" in _vllm_distribution_version():
             if "cpu" in backends:
                 HAS_TRITON = True
             else:

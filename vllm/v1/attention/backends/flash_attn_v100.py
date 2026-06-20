@@ -452,7 +452,12 @@ def _get_paged_kv_utils():
 
             _paged_kv_utils = paged_kv_utils
         except ImportError:
-            _paged_kv_utils = None
+            try:
+                from flash_attn_v100 import paged_kv_utils
+
+                _paged_kv_utils = paged_kv_utils
+            except ImportError:
+                _paged_kv_utils = None
     return _paged_kv_utils
 
 

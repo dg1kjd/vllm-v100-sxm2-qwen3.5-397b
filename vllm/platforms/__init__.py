@@ -24,12 +24,15 @@ def vllm_version_matches_substr(substr: str) -> bool:
 
     try:
         vllm_version = version("vllm")
-    except PackageNotFoundError as e:
-        logger.warning(
-            "The vLLM package was not found, so its version could not be "
-            "inspected. This may cause platform detection to fail."
-        )
-        raise e
+    except PackageNotFoundError:
+        try:
+            vllm_version = version("1cat-vllm")
+        except PackageNotFoundError as e:
+            logger.warning(
+                "The vLLM package was not found, so its version could not be "
+                "inspected. This may cause platform detection to fail."
+            )
+            raise e
     return substr in vllm_version
 
 
