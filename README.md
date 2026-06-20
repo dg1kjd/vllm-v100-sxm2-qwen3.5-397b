@@ -120,7 +120,7 @@ Install both wheels from the directory where you downloaded them:
 python -m pip install --prefer-binary --no-cache-dir \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
   ./flash_attn_v100-*.whl \
-  ./vllm-*.whl
+  ./1cat_vllm-*.whl
 ```
 
 Notes:
