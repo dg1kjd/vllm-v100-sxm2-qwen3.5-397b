@@ -11,6 +11,7 @@ ApplyRotaryEmb methods based on the calling context:
 3. RotaryEmbedding.forward_hip() -> ApplyRotaryEmb.forward() (auto-dispatch)
 """
 
+import builtins
 from dataclasses import dataclass
 
 import pytest
@@ -25,6 +26,42 @@ from vllm.config import (
 from vllm.platforms import current_platform
 
 CUDA_DEVICES = ["cuda:0"]
+
+
+def test_apply_rotary_emb_cuda_falls_back_without_vllm_flash_attn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+    vllm_config = VllmConfig(
+        compilation_config=CompilationConfig(custom_ops=["all", "+apply_rotary_emb"])
+    )
+    get_cached_compilation_config.cache_clear()
+
+    with set_current_vllm_config(vllm_config):
+        rotary = ApplyRotaryEmb(enforce_enable=True)
+        x = torch.randn(4, 2, 8, dtype=torch.float32)
+        cos = torch.randn(4, 4, dtype=torch.float32)
+        sin = torch.randn(4, 4, dtype=torch.float32)
+        expected = rotary.forward_native(x, cos, sin)
+        original_import = builtins.__import__
+
+        def import_without_vllm_flash_attn(
+            name,
+            globals=None,
+            locals=None,
+            fromlist=(),
+            level=0,
+        ):
+            if name == "vllm.vllm_flash_attn.layers.rotary":
+                raise ImportError("missing vllm flash attention extension")
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_vllm_flash_attn)
+
+        actual = rotary.forward_cuda(x, cos, sin)
+
+        torch.testing.assert_close(actual, expected)
 
 
 @dataclass
