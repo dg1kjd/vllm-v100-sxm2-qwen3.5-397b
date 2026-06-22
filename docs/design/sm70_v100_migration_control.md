@@ -143,6 +143,293 @@ Active continuation update, 2026-06-01:
   decode. Mixed prefill/decode results cannot be counted as final SM70
   Flash-V100 performance.
 
+Dynamic partition correction update, 2026-06-21:
+
+- The old Qwen3.6-27B-AWQ TP2 Flash-V100 artifact
+  `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_flashv100_dynpart_decay_i16k_32k_64k_o1024_w1_r1_tp2_20260615.json`
+  is no longer accepted by itself as speed evidence for "long decode does not
+  slow down". The flat 16K/32K/64K decode pattern matches an unsafe
+  operator-level failure mode, but the artifact lacks the active-partition and
+  dispatch trace needed to prove whether that exact run hit the failure.
+- Dynamic partitioning is correct when `active_num_partitions` equals the
+  runtime `ceil(seq_len / partition_size)` and the launch envelope covers it.
+  It is not correct when a stale/too-small active value is used as a hard
+  correctness bound: that omits valid KV partitions from both the partition
+  kernel and the cross-partition softmax reduce.
+- 0.0.5 did not make every dynamic-partition route unsafe. Its exact paged
+  decode route ignores `active_num_partitions` and matched the full reference
+  in a direct V100 check. Its legacy active-bound route, however, reproduced the
+  same stale-active failure mode when forced with `active_num_partitions=1` for
+  a 513-token decode that needs 3 partitions (`maxdiff=0.2551` vs the correct
+  active value).
+- Fixed `flash-attention-v100/kernel/flash_decode_paged.cu` so
+  `active_num_partitions` is only a runtime scheduling hint. The partition and
+  reduce kernels now preserve the sequence-length-derived partition count for
+  correctness when the active value is stale or too small.
+- Added `test_stale_active_num_partitions_does_not_truncate_decode` in
+  `tests/kernels/attention/test_sm70_flash_v100_decode_planner.py`. On V100 it
+  verifies `active_num_partitions=1` produces bitwise-equal output to the
+  correct `active_num_partitions=3` for a 513-token decode.
+- Rebuilt `flash-attn-v100` in `vllm-0.0.5-t210` and verified:
+  `pytest -q tests/kernels/attention/test_sm70_flash_v100_decode_planner.py`
+  passed (`6 passed`), and the direct stale-active operator check passed with
+  `torch.equal=True`, `maxdiff=0.0`.
+- Correctness-preserving retest on Qwen3.6-27B-AWQ TP2, no-MTP,
+  `FLASH_ATTN_V100`, output 1024, max model len 131072:
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_dynpart_kernel_guard_i16k_64k_o1024_tp2_20260621.json`.
+  Results: 16K steady decode `49.52 tok/s` (`20.66s` decode), 64K steady
+  decode `35.37 tok/s` (`28.92s` decode). Treat this as the valid post-fix
+  baseline unless a future exact kernel optimization improves it.
+
+Safe XQA decode recovery update, 2026-06-21:
+
+- The old "flat long decode" artifact must not be restored through active
+  partition truncation. Exact full-attention decode for Qwen3.6-27B-AWQ has to
+  read more KV at 64K than 16K, so a safe optimization should reduce kernel
+  cost, not skip valid KV partitions.
+- Ported the 0.0.5 large-page XQA wide decode route into the current
+  Flash-V100 extension as an explicit opt-in:
+  `VLLM_FLASH_V100_DECODE_USE_XQA=1`. Scope is intentionally narrow:
+  fp16 KV, `D=256`, `q_per_kv in {4, 6, 8}`, paged decode, no sliding window.
+  The stale-active guard keeps sequence-length-derived partition coverage, so
+  this route cannot use `active_num_partitions` to truncate attention.
+- Direct V100 operator check, TP2 27B-like shape
+  (`B=1`, `H=12`, `Hkv=2`, `D=256`, page size `784`):
+  - 16K scalar `0.239565 ms`, XQA `0.164296 ms`, `1.46x`, `maxdiff=3.05e-5`.
+  - 64K scalar `0.811540 ms`, XQA `0.616806 ms`, `1.32x`, `maxdiff=1.53e-5`.
+  - Stale-active check: `active=1` vs correct active partitions produced
+    `torch.equal=True`, `maxdiff=0.0`.
+- Qwen3.6-27B-AWQ TP2 no-MTP endpoint A/B, output 256, same token hashes:
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_scalar_i16k_64k_o256_tp2_20260621.json`
+  vs
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_xqa_i16k_64k_o256_tp2_20260621.json`.
+  Results: 16K steady decode `49.75 -> 52.19 tok/s` (`+4.90%`), 64K steady
+  decode `35.55 -> 38.89 tok/s` (`+9.40%`).
+- Decision: keep XQA default-off until broader 27B/35B, longer-output, and
+  quality gates are run. It is the current safe recovery path for long decode
+  speed, but it does not justify reusing the older "no long-context slowdown"
+  release claim.
+
+Follow-up on the old flat-decode target, 2026-06-21:
+
+- Direct 0.0.5 XQA op reproduction with forced stale `active_num_partitions=1`
+  reproduces the flat-speed shape but not correctness:
+  - 16K correct active `64`: `0.161162 ms`; stale active `1`: `0.059950 ms`;
+    `maxdiff=0.43686676025390625`.
+  - 64K correct active `256`: `0.614943 ms`; stale active `1`: `0.059853 ms`;
+    `maxdiff=0.3969764709472656`.
+- This is the only reproduced mechanism so far that gives the old flat-speed
+  shape: the attention work is bounded by a stale active partition count. The
+  older model-level artifact did not record active partition traces, so it must
+  not be treated as proof of a safe flat-decode implementation.
+- Tested larger partition experiments under the current correctness-preserving
+  path:
+  - Global `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=512` plus XQA improved the
+    27B-AWQ TP2 `o256` probe and kept hashes for both 16K and 64K, but this
+    changes scalar and XQA reduction boundaries together and conflicts with
+    earlier long-output p512/p1024 token-divergence evidence. It remains a
+    diagnostic candidate, not accepted default.
+  - An XQA-only p512 override was tested separately and rejected: 64K hash
+    matched, but 16K hash changed
+    (`0f892ef276684fd8ec89d50877876f2fc7e383ab1914024868e2ca528b0ce0e3`
+    vs the accepted
+    `ed7b52718d217fe807ec639568d657b6726f7c08e471b9b0dc31cc49d3efec54`).
+- Accepted status after this follow-up: keep the safe XQA p256 opt-in and the
+  stale-active guard. Do not claim or chase "flat decode" by truncating valid KV
+  partitions.
+
+Dynamic active trace follow-up, 2026-06-21:
+
+- Added a default-off diagnostic gate:
+  `VLLM_FLASH_V100_TRACE_DECODE_ACTIVE=1`. The trace is CUDA-graph safe: decode
+  call-site tracing skips stream capture, and active partition values are logged
+  from the metadata builder before they are written to the persistent device
+  tensor.
+- Added a small trace case file:
+  `bench_results/sm70_migration_20260621/trace_active_cases_i16k_64k_o16.json`.
+  The validation run used Qwen3.6-27B-AWQ TP2, no-MTP, Torch
+  `2.10.0+cu128`, `FLASH_ATTN_V100`, `VLLM_FLASH_V100_DECODE_USE_XQA=1`,
+  `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`, max model len `131072`.
+  Artifact:
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_xqa_trace_active_i16k_64k_o16_tp2_20260621.json`;
+  log:
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_xqa_trace_active_i16k_64k_o16_tp2_20260621.log`.
+- Trace result:
+  - CUDA graph capture used fixed workspace capacity
+    `workspace_hint=131072`, `workspace_partitions=512`, with dummy
+    `seq_len_hint=1`, `active=1`.
+  - Runtime 16K decode logged `seq_len_hint=16385`, `partition=256`,
+    `active=65`, `expected_active=65`.
+  - Runtime 64K decode logged `seq_len_hint=65537`, `partition=256`,
+    `active=257`, `expected_active=257`.
+  - Therefore the current dynamic partition path is active and mathematically
+    consistent; replay is not stuck at the full 512-partition workspace.
+- Speed in the same trace run:
+  - 16K steady decode `52.00 tok/s`, decode time `0.2884s` for 15 steady
+    tokens.
+  - 64K steady decode `38.74 tok/s`, decode time `0.3872s` for 15 steady
+    tokens.
+  This keeps the current XQA p256 result consistent with the `o256` probe:
+  dynamic active works, but exact full-attention decode still scales with the
+  number of valid KV partitions.
+- Also tightened route summary accounting so an XQA decode is not double-counted
+  as `decode_scalar_paged` by the outer forward path.
+
+0.0.5 XQA partition follow-up, 2026-06-21:
+
+- Compared the current XQA port against the 0.0.5 Flash-V100 source under
+  `/home/ymzx/桌面/1cat-vllm/1cat-vllm-0.0.5/flash-attention-v100-1cat-0.0.5`.
+  Important old-only pieces:
+  - `VALID_DECODE_PARTITION_SIZES=(32,64,128,256,512,1024)`.
+  - The 0.0.5 planner auto-selected coarser D=256 GQA/MQA partitions:
+    `512` at >=4K and `1024` at >=12288 tokens for small batches.
+  - The 0.0.5 XQA path allowed FP32 `tmp_out` via
+    `VLLM_FLASH_V100_XQA_FP32_TMP_OUT=1` for `D=256`, `q_per_kv in {4,6,8}`.
+  - Current XQA port intentionally keeps only the narrow safe slice:
+    D=256, `q_per_kv in {4,6,8}`, p256/p512/p1024, fp16 `tmp_out`.
+- Old 0.0.5 operator sweep, same synthetic 27B-like shape
+  (`B=1`, `H=12`, `Hkv=2`, `D=256`, page size `784`, seq `65536`),
+  artifact log:
+  `bench_results/sm70_migration_20260621/old005_xqa_fp32_tmp_partition_sweep_64k_20260621.log`.
+  Results vs old FP32 p256:
+  - fp16 p256 `0.717ms`, maxdiff `3.81e-6`.
+  - fp16 p512 `0.666ms`, maxdiff `3.81e-6`.
+  - fp16 p1024 `0.642ms`, maxdiff `3.81e-6`.
+  - fp32 p256 `0.699ms`, baseline.
+  - fp32 p512 `0.663ms`, maxdiff `3.81e-6`.
+  - fp32 p1024 `0.638ms`, maxdiff `3.81e-6`.
+  FP32 tmp_out does not make larger partitions bitwise-equivalent to p256; it
+  is not enough to justify restoring p512/p1024 as a default.
+- Current operator sweep, same synthetic shape, artifact log:
+  `bench_results/sm70_migration_20260621/current_xqa_partition_sweep_64k_20260621.log`.
+  Results vs current p256:
+  - p256 `0.694ms`, baseline.
+  - p512 `0.646ms`, maxdiff `3.81e-6`.
+  - p1024 `0.613ms`, maxdiff `3.81e-6`.
+  The current XQA port is not slower than the old implementation for this
+  shape; larger partitions provide only a modest 64K kernel win and still alter
+  reduction order.
+- Current p256 vs p1024 sequence-length sweep, artifact log:
+  `bench_results/sm70_migration_20260621/current_xqa_p256_p1024_seq_sweep_20260621.log`.
+  - p256: 16K `0.228ms` active `64`; 64K `0.685ms` active `256`.
+  - p1024: 16K `0.334ms` active `16`; 64K `0.612ms` active `64`.
+  Larger partitions reduce the 64K cost but do not make exact decode flat; they
+  also remain inconsistent with earlier model-level p512/p1024 token divergence.
+- Decision: do not restore the old auto-p512/p1024 planner as a public default.
+  The only safe candidate worth carrying forward later is a guarded FP32
+  `tmp_out` XQA diagnostic lane, but it still needs long-output hash/logprob
+  evidence and does not explain the old completely flat artifact.
+
+Adaptive XQA decode partition policy, 2026-06-22:
+
+- Clarified the terminology: `partition_size` is the per-KV-partition tile
+  size, while `active_num_partitions` is still dynamic and is recomputed from
+  the runtime sequence length. The accepted direction is adaptive
+  `partition_size` plus dynamic active partitions, not a global hard-coded
+  `p512`.
+- Model-level partition sweep on Qwen3.6-27B-AWQ TP2, no-MTP,
+  `FLASH_ATTN_V100`, XQA enabled, `max_model_len=262144`,
+  `max_num_batched_tokens=8192`:
+  - 4K/o128: p256 `55.92 tok/s`, p512 `53.27`, p1024 `48.65`; all hashes
+    matched p256, but p256 is clearly best.
+  - 64K/o128: p256 `36.19 tok/s`, p512 `36.82`, p1024 `36.60`; all hashes
+    matched p256, p512 is slightly best.
+  - 128K/o128: p256 `26.88 tok/s`, p512 `26.76`, p1024 `27.51`; all hashes
+    matched p256, p1024 is best.
+  - 262080/o64: p256 `18.42 tok/s`, p512 `18.93`, p1024 `18.67`; all hashes
+    matched p256, p512 is best.
+- Updated the default adaptive policy when
+  `VLLM_FLASH_V100_DECODE_PARTITION_SIZE` is unset after the TP4 long-decode
+  sweep:
+  - `<32768`: p256.
+  - `>=32768`: p1024.
+  Explicit `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=256/512/1024` still overrides
+  the policy for diagnostics and rollback.
+- Validation artifact:
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_xqa_adaptive_gate_i4k_64k_128k_o16_tp2_20260622.json`;
+  log:
+  `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_xqa_adaptive_gate_i4k_64k_128k_o16_tp2_20260622.log`.
+  Trace showed the adaptive policy in effect:
+  `4097 -> p256 active=17`, `65537 -> p512 active=129`,
+  `131009 -> p1024 active=128`, with `decode_xqa_paged=48` route hits.
+
+Default-on XQA decode update, 2026-06-22:
+
+- Supersedes the earlier default-off XQA decision for the guarded safe slice.
+- `VLLM_FLASH_V100_DECODE_USE_XQA` now defaults to `1`; users can set it to
+  `0` to force scalar paged decode.
+- The route is still narrow and falls back outside the accepted scope:
+  fp16 KV, D=256, `q_per_kv in {4,6,8}`, paged decode, no sliding window.
+- `q_per_kv=4` is the Qwen3.6-35B-A3B-AWQ TP4 shape and is additionally
+  gated by the long-context hint. The default threshold is
+  `VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN=32768`, so short `max_model_len`
+  profiles can keep scalar paged decode while long-context service graphs use
+  the XQA path.
+- TP4 Qwen3.6-27B-AWQ evidence with matching token hashes:
+  - 64K/o64 scalar `50.55 tok/s`; XQA p1024 `58.07 tok/s` (`+14.9%`).
+  - 128K/o64 scalar `37.92 tok/s`; XQA p1024 `46.93 tok/s` (`+23.8%`).
+  - 262K/o64 scalar `22.92 tok/s`; XQA p1024 `34.23 tok/s` (`+49.4%`).
+- TP4 Qwen3.6-35B-A3B-AWQ default-route evidence, no MTP,
+  `FLASH_ATTN_V100`, `max_model_len=65536`, `max_num_batched_tokens=8192`,
+  output 256:
+  - 4K prefill `0.278s`, steady decode `118.88 tok/s`.
+  - 16K prefill `1.380s`, steady decode `117.21 tok/s`.
+  - 64K prefill `12.069s`, steady decode `92.62 tok/s`.
+  - Runtime active trace: `4097 -> p256 active=17`,
+    `16385 -> p256 active=65`, `65281 -> p1024 active=64`.
+  - Route summary included both scalar and XQA hits:
+    `decode_scalar_paged=10`, `decode_xqa_paged=20`.
+- The current default partition policy remains adaptive with dynamic active
+  partitions: p256 below 32K and p1024 at 32K or above unless
+  `VLLM_FLASH_V100_DECODE_PARTITION_SIZE` is explicitly set.
+- TP4 default-route smoke across 27B quantization variants, no MTP,
+  `FLASH_ATTN_V100`, `max_model_len=65536`, `max_num_batched_tokens=8192`,
+  output 64:
+  - Qwen3.6-27B-AWQ: 4K `69.74 tok/s`, 64K `54.63 tok/s`;
+    route summary `decode_xqa_paged=48`.
+  - Qwen3.6-27B-FP8: 4K `66.22 tok/s`, 64K `53.16 tok/s`;
+    route summary `decode_xqa_paged=48`.
+  - Qwen3.5-27B-NVFP4/compressed-tensors: 4K `70.50 tok/s`,
+    64K `56.32 tok/s`; route summary `decode_xqa_paged=48`.
+  - Outputs were readable in all three smokes. NVFP4 still logs the known
+    compressed-tensors global-scale mismatch warning for fused layers, so keep
+    it in the quality-watch bucket.
+- SM70 `FLASH_ATTN_V100` multimodal default remains image-enabled:
+  if the user does not set `--limit-mm-per-prompt` and does not request
+  `--language-model-only`, V100 serving sets `image=1`, `video=0`. Config-only
+  checks confirmed this for local Qwen3.6-27B-AWQ and Qwen3.5-27B-NVFP4.
+
+Stability follow-up, 2026-06-22:
+
+- Made FlashInfer allreduce fusion a true optional import. If `flashinfer.comm`
+  exists but cannot initialize its JIT/cache log, compile backend import now
+  disables only that optional fusion instead of failing unrelated MTP/model-load
+  paths. Local repro used a root-owned
+  `/home/ymzx/.cache/flashinfer/0.6.11.post2/70_89/flashinfer_jit.log`.
+- Disabled the custom CUDA repetition-penalty kernel on SM70 and use the torch
+  fallback instead. This avoids `cudaErrorNoKernelImageForDevice` on V100 for
+  requests using frequency/presence/repetition penalties.
+- Refreshed the GPUModelRunner draft-probability alignment regression test for
+  the current `_sample` signature and token-id alignment guard.
+- Validation:
+  - `tests/v1/spec_decode/test_mtp.py -k 'mtp or draft or probability or cache'`:
+    2 passed with proxy env unset.
+  - `tests/v1/core/test_scheduler.py -k 'mtp or speculative or chunk'`:
+    6 passed with proxy env unset.
+  - `tests/v1/sample/test_rejection_sampler.py`: 67 passed on V100.
+  - `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py`,
+    `tests/v1/spec_decode/test_sm70_mtp_safety.py`,
+    `tests/v1/spec_decode/test_mtp_proposer_step_index.py`: 15 passed.
+  - Qwen3.6-27B-AWQ TP4 short smoke, no MTP, default multimodal image profile:
+    prefill `0.739s`, steady decode `26.18 tok/s`, route summary included
+    `prefill_no_prefix_dense_flash=16` and `decode_xqa_paged=48`, output text
+    was readable.
+- Remaining log-noise candidates from the smoke:
+  - repeated Transformers `use_fast` deprecation lines from every worker;
+  - `Failed to read file <frozen os>` warning during torch compile;
+  - `No available shared memory broadcast block found in 60 seconds` during
+    expected long compile/capture.
+
 ## Current State Summary
 
 Latest upstream vLLM currently has no local SM70 TurboMind backend:
@@ -35200,3 +35487,1491 @@ Interpretation:
     `26514f49d19f5ba1cca5fc71c8ae28834263c50054b6db43f6e95a282b5a221a`.
   - This verifies the speed recovery did not change the deterministic greedy
     output for this benchmark prompt.
+
+2026-06-20 Qwen3.6-27B-AWQ TP2 Nsight Systems decode profile:
+
+- GPU-use rule recorded for follow-up work:
+  - Use TP2 unless the target changes.
+  - Use any suitable free V100 pair directly, but never stop, kill, reset, or
+    otherwise interfere with another user's GPU process. If a needed GPU is
+    busy, wait or choose a different free pair.
+  - During this profile, GPU3 had another `VLLM::EngineCore` process, so all
+    runs avoided GPU3. The successful profile used
+    `CUDA_VISIBLE_DEVICES=1,2`.
+- Failed startup paths that should not be repeated blindly:
+  - The first compile-graph profile attempt with nsys on GPUs 0/1 failed before
+    measured repeat; the worker exited during engine initialization.
+  - A non-nsys compile-graph smoke with `gpu_memory_utilization=0.6` failed
+    with `Available KV cache memory: -7.0 GiB`. Raising gmem to `0.88`
+    fixed KV sizing, but both GPUs 0/1 and 1/2 still exited during mixed
+    prefill-decode CUDA graph capture after AWQ warmup. No valid speed/profile
+    artifact was produced for this compile-graph lane.
+  - The no-compile decode-graph lane initially triggered the Qwen3-VL dummy
+    multimodal profile and failed because this `1cat-vllm-1.2.0-releasecheck`
+    environment does not provide `_vllm_fa2_C`. Passing
+    `--engine-arg 'limit_mm_per_prompt={"image":0,"video":0}'` forced the
+    intended text-only route and fixed startup.
+- Successful profile artifact:
+  - Command shape: Qwen3.6-27B-AWQ, TP2, GPUs 1/2, input 4096, output 32,
+    warmup 1, repeat 1, greedy ignore-EOS, `max_model_len=8192`,
+    `max_num_batched_tokens=4096`, `max_num_seqs=1`,
+    `gpu_memory_utilization=0.88`, Flash-V100 attention, no-compile decode
+    CUDA graph (`VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1`,
+    `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=0`), text-only multimodal
+    limit, and nsys `--cuda-graph-trace=node`.
+  - Files:
+    `bench_results/nsys_27b_awq_tp2_20260620/27b_awq_tp2_i4096_o32_decodegraph_textonly_nsys.json`,
+    `.nsys-rep`, and `.sqlite`.
+  - Route logs confirmed Flash-V100 prefill/decode, GDN FlashQLA decode,
+    AWQ TurboMind dense, SM70 fused LM-head top1, and TP custom all-reduce.
+  - The nsys run recorded steady decode `42.6708 tok/s` and TPOT
+    `23.435 ms`. This is slower than normal non-profile 256-token decodegraph
+    evidence (`46.5455 tok/s`) because node-level nsys tracing adds overhead,
+    so use this artifact for bottleneck distribution rather than accepted
+    speed.
+- Per-token decode breakdown from the sqlite:
+  - Stable decode windows: 30 windows after skipping the first graph launch
+    that was tied to the prefill dependency tail. Mean `24.08 ms`, median
+    `23.40 ms`, min `21.65 ms`, max `42.58 ms`.
+  - Per-device aggregate kernel-time split in those stable windows:
+    dense GEMM `54.0-54.6%`; elementwise/cache/misc small kernels
+    `18.6-20.6%`; TP all-reduce `6.4-8.0%`; LM-head top1/sampler
+    `5.7-5.8%`; Flash-V100 decode attention `5.5-5.6%`;
+    GDN/linear-attention small ops `2.8-3.0%`; RMSNorm `2.5-2.7%`.
+  - The largest individual steady-decode kernels were TurboMind dense GEMM
+    variants, followed by `vllm::cross_device_reduce_1stage`, LM-head top1
+    stage1, and Flash-V100 decode partition kernels.
+- Interpretation:
+  - For 27B-AWQ TP2 decode, the main bottleneck is dense GEMM, not
+    Flash-V100 attention or GDN FlashQLA. Attention and GDN together are a
+    small minority of stable decode GPU time on this profile.
+  - The next narrow optimization target should be AWQ/F16 dense GEMM dispatch
+    and the surrounding small-kernel launch/copy pattern. TP all-reduce and
+    LM-head top1 are secondary. Do not spend the next iteration on attention
+    unless a compile-graph same-criterion profile contradicts this split.
+  - Re-run the same nsys method on the accepted compile-graph speed lane when
+    the usual GPUs 2/3 are both free, because the current profile is a
+    no-compile decode-graph diagnostic lane.
+
+2026-06-20 Qwen3.6-27B-AWQ TP2 TurboMind source selector:
+
+- Scope: TurboMind AWQ dense path only; Marlin is intentionally unchanged.
+- Code path:
+  - `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu`
+    now has a default-on `VLLM_SM70_AWQ_TP2_FAST_SELECTOR` cache-miss selector.
+  - `vllm/envs.py` exposes the same environment gate, defaulting to enabled.
+- Exact descriptors promoted after today's source-path micro and TP2 route
+  trace:
+  - `sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1` ->
+    `8x256x64`, `splits=3`, `swizzle=3`.
+  - `sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1` ->
+    `8x256x64`, `splits=7`, `swizzle=0`.
+- End-to-end evidence:
+  - Baseline artifact
+    `bench_results/nsys_27b_awq_tp2_20260620/27b_awq_tp2_i512_o128_currentgraph_turbomind_fixed_r3.json`:
+    TPOT `18.796 ms`, steady decode `53.201 tok/s`.
+  - Source selector artifact
+    `bench_results/nsys_27b_awq_tp2_20260620/27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_r3.json`:
+    TPOT `17.759 ms`, steady decode `56.309 tok/s`, `+5.84%` vs fixed.
+  - Token hash stayed identical:
+    `25acc1257b65019cd7398d36105134378675d9de82bc7d30c6b49d78b1f7b755`.
+- Rejected descriptors:
+  - Do not hard-enable the dynamic choices for `1x5120x8704` or
+    `1x8192x5120`: today's source-path microbench measured default faster
+    (`0.04221 ms` vs `0.05949 ms`, and `0.04379 ms` vs `0.06072 ms`).
+- Follow-up:
+  - The external no-preserve LUT experiment reached `57.285 tok/s`
+    (`+7.68%`), so there is still about `1.7%` absolute steady-TPS gap between
+    the source selector and that best diagnostic lane. Closing it needs deeper
+    exact-selector/kernel work, not broad dynamic measurement.
+  - Direct script validation must pass
+    `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm`; otherwise the releasecheck
+    conda environment can import its installed vLLM instead of this source
+    tree.
+
+2026-06-20 Qwen3.6-27B-AWQ TP2 TurboMind tile-level probe:
+
+- Target descriptor: `sm70_f16_u4k128_f16_tnt_fff_1x5120x8704_1`, the TP2 MLP
+  down group that remains unpromoted by the source fast selector.
+- Post-selector NCU artifact:
+  `bench_results/nsys_27b_awq_tp2_20260620/ncu/awq_m1_k8704_n5120_postselector_warpstats.ncu-rep`.
+- NCU result for the default `8x256x64, splits=7, swizzle=0` launch:
+  - Duration `48.256 us`, grid `140 CTAs`, waves/SM `0.65`.
+  - Registers/thread `160`, dynamic shared memory/block `20.512 KiB`.
+  - Achieved occupancy `11.47%`, active warps/SM `7.34`.
+  - SM throughput `33.49%`, Tensor pipe `15.82%`, DRAM throughput `45.87%`,
+    L1/TEX throughput `56.43%`.
+  - Scheduler no-eligible cycles `62.63%`.
+- Tile probes:
+  - Default `8x256x64,s7,w0`: `0.04036 ms` CUDA event avg.
+  - Existing `8x128x32,s7,w0`: `0.04376 ms`, slower.
+  - Existing `8x128x64,s7,w0`: `0.05080 ms`, slower.
+  - Temporary new `8x256x32,s10,w0`: `0.04387 ms`, slower.
+  - Temporary new `8x64x32,s14,w3`: `0.05052 ms`, slower.
+  - Temporary new `8x64x64,s7,w0`: `0.05089 ms`, slower.
+- Code hygiene:
+  - The temporary probe selector and rejected `8x256x32`/`8x64` registry
+    instantiations were removed after measurement.
+  - Do not re-add these generic GEMM-template variants unless a new same-source
+    microbench shows a win.
+- Next implementation direction:
+  - Existing generic GEMM tile scaling does not fix the low Tensor pipe/low
+    occupancy issue for this M=1 AWQ decode shape. A useful M=1-specific AWQ
+    dense path must still preserve HMMA/tile-level dataflow; do not assume a
+    scalar per-column GEMV replacement will be faster.
+
+2026-06-20 Qwen3.6-27B-AWQ TP2 TurboMind M=1 GEMV rejection and 17408 NCU:
+
+- Transient scalar GEMV probe:
+  - I added, built, and measured a temporary source-local experimental op that
+    used a pre-transposed raw AWQ qweight layout `[N/8, K]`, one warp per
+    8 output columns, and group-level scale/zero reuse.
+  - The probe was numerically aligned with TurboMind on the target
+    `M=1,K=8704,N=5120,group=128` microbench (`max_abs=0.001953`,
+    `mean_abs=0.000276`), but it was much slower:
+    - Current TurboMind `8x256x64,s7,w0`: `0.03980 ms`.
+    - Transposed scalar GEMV probe: `0.13601 ms` (`3.42x` slower).
+  - Artifact:
+    `bench_results/nsys_27b_awq_tp2_20260620/awq_gemv_transposed_k8704_n5120_probe.json`.
+  - The temporary op and bindings were removed after measurement. Do not
+    reintroduce this scalar-GEMV direction unless the kernel design changes
+    materially; the performance issue is not qweight nibble-order correctness.
+- Post-selector `1x17408x5120` NCU:
+  - Artifacts:
+    `bench_results/nsys_27b_awq_tp2_20260620/ncu/awq_m1_n17408_k5120_postselector_warpstats.ncu-rep`,
+    `_details.txt`, `_raw.csv`,
+    `awq_m1_n17408_k5120_postselector_compute.ncu-rep`, and compute exports.
+  - Fast selector launch: `8x256x64,splits=3,swizzle=3`.
+  - Stable repeat200 CUDA event avg:
+    `bench_results/nsys_27b_awq_tp2_20260620/awq_m1_n17408_k5120_postselector_repeat200.json`
+    -> `0.06184 ms`; post-cleanup repeat50
+    `awq_m1_n17408_k5120_postcleanup_repeat50.json` -> `0.06248 ms`.
+  - NCU counters for the selected launch:
+    duration `70.624 us`, grid `216 CTAs`, waves/SM `1.00`,
+    registers/thread `160`, dynamic shared memory/block `20.512 KiB`,
+    achieved occupancy `18.13%`, active warps/SM `11.60`, SM throughput
+    `43.88%`, Tensor pipe `23.60%`, DRAM throughput `61.29%`, L1/TEX
+    throughput `75.96%`, scheduler no-eligible cycles `50.59%`.
+  - TurboMind's own measure path with fast selector disabled selected
+    `8x128x32,splits=10,swizzle=3` and measured `0.06567 ms`
+    (`awq_m1_n17408_k5120_tune_repeat200.json`), slower than the source fast
+    selector. Keep the promoted selector spec for this descriptor.
+- Updated implication:
+  - The next useful work is not more generic tile variants and not scalar
+    GEMV. Focus on an HMMA-preserving M=1/small-M variant that lowers
+    register/shared pressure or split/tail overhead, or on reducing/fusing the
+    number of AWQ GEMM launches around the TurboMind backend.
+
+2026-06-20 Qwen3.6-27B-AWQ TP2 custom all-reduce small-message tuning:
+
+- Scope:
+  - This was the first communication-side step after the nsys TileRT-style
+    overlap analysis. It targets the hidden-state custom all-reduce latency
+    visible after row-parallel AWQ/F16 projections; it is not a replacement for
+    GEMM/activation/reduce tile fusion.
+- Code path:
+  - `csrc/custom_all_reduce.cuh` now chooses `block_limit=1` automatically only
+    for SM70, `world_size=2`, and payloads `<= 40 KiB`.
+  - Larger messages keep the previous default block limit. The explicit
+    override `VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT=<1..36>` remains available.
+  - `vllm/envs.py` registers the override variable to avoid unknown-env
+    warnings.
+- Microbench evidence:
+  - `bench_results/nsys_27b_awq_tp2_20260620/custom_ar_block_limit_sizes_fp16_tp2.json`
+    measured TP2 fp16 graph-replay latency:
+    - `5120` elements: `block_limit=1` `10.59 us` vs `36` `12.96 us`.
+    - `10240` elements: `11.47 us` vs `13.03 us`.
+    - `20480` elements: `12.59 us` vs `13.45 us`.
+    - `40960` elements: `block_limit=1` is slower (`15.67 us` vs `14.45 us`).
+    - `81920` elements: `block_limit=1` is much slower (`21.70 us` vs
+      about `16.05-16.35 us`).
+  - `custom_ar_block_limit_autoheuristic_check.json` confirmed the default
+    heuristic follows the small-message path for `5120` elements and keeps the
+    old route for `40960`.
+- End-to-end evidence, same GPU0/1, 27B-AWQ TP2, `i512/o128`, CUDA graph,
+  TurboMind fast selector:
+  - Pre-heuristic default AR
+    `27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_defaultar_gpu01_r3.json`:
+    steady decode `56.168 tok/s`, TPOT `17.804 ms`.
+  - Explicit `VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT=1`
+    `27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_arblk1_r3.json`:
+    steady decode `56.612 tok/s`, TPOT `17.664 ms`.
+  - Source auto heuristic
+    `27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_autoar_gpu01_r3.json`:
+    steady decode `56.450 tok/s`, TPOT `17.715 ms`.
+  - Token hash stayed identical:
+    `25acc1257b65019cd7398d36105134378675d9de82bc7d30c6b49d78b1f7b755`.
+- Implication:
+  - This is a real but small default win, around `+0.5%` end-to-end on the
+    same-GPU comparison. Do not keep spending time on multi-kernel AR chunking:
+    previous chunk tests showed multiple chunk AR launches scale badly. The next
+    larger step remains a fused/chunk-aware single engine: preferably AWQ
+    down-GEMM epilogue plus TP2 reduce, or a GPU-resident tile runtime that
+    avoids re-reading GEMM output through a separate custom AR kernel.
+
+2026-06-20 Qwen3.6-35B-A3B-AWQ TP2 Nsight Systems decode profile:
+
+- Scope correction:
+  - The profiling target for this task is 35B-AWQ, not 27B-AWQ. The preceding
+    27B nsys profile is retained only as a diagnostic-method reference and must
+    not be used to infer the 35B bottleneck.
+  - GPU policy for all follow-up runs: use suitable free V100s directly, but
+    never stop, kill, reset, or otherwise interfere with a GPU process unless
+    it was started by the current agent run or the operator explicitly
+    authorizes the exact process. A parent `codex` process is not sufficient
+    ownership evidence, because another Codex agent may be working in the same
+    machine.
+- Successful profile artifact:
+  - Command shape: Qwen3.6-35B-A3B-AWQ, TP2, GPUs 0/1, input 4096, output 32,
+    warmup 1, repeat 1, greedy ignore-EOS, `max_model_len=8192`,
+    `max_num_batched_tokens=4096`, `max_num_seqs=1`,
+    `gpu_memory_utilization=0.6`, Flash-V100 attention, 0.0.3 compile-graph
+    policy (`VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`,
+    `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=0`), AWQ tune pinned off
+    (`VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0`), packed recurrent decode enabled,
+    `VLLM_SM70_LM_HEAD_TOP1=0`, text-only multimodal limit, and nsys
+    `--cuda-graph-trace=node`.
+  - Files:
+    `bench_results/nsys_35b_awq_tp2_20260620/35b_awq_tp2_i4096_o32_compilegraph_awqtune0_nsys.json`,
+    `.nsys-rep`, and `.sqlite`.
+  - Route logs confirmed text-only mode, Flash-V100 prefill/decode, GDN
+    FlashQLA decode, SM70 GDN schedule gates, SM70 AWQ MoE TurboMind batched
+    path, legacy single-token AWQ MoE compact path, TP custom all-reduce, and
+    CUDA graph capture completion.
+  - The nsys diagnostic run recorded steady decode `85.4383 tok/s`, TPOT
+    `11.704 ms`, prefill `0.5446 s`, and pure decode `0.3628 s` for 32
+    output tokens. This is slower than the non-profile 4K/256 compile-graph
+    reference
+    `bench_results/sm70_migration_20260619/decode_qwen36_35b_a3b_awq_auto_kv_i4096_o256_tp2_compilegraph_awqtune0_moefix_g01_20260619.json`
+    (`102.3617 tok/s`, TPOT `9.769 ms`) because node-level nsys tracing adds
+    overhead. Use this artifact for bottleneck distribution, not accepted
+    speed.
+- Per-token decode breakdown from the sqlite:
+  - The profile contained 62 `cudaGraphLaunch_v10000` runtime calls, i.e. 31
+    replay pairs across the two TP workers. The first replay pair was skipped
+    because it was tied to the prefill/first-token tail. The 29 complete
+    steady intervals between the remaining replay pairs had mean `11.696 ms`,
+    median `11.701 ms`, min `10.913 ms`, and max `11.917 ms`, matching the
+    benchmark JSON TPOT.
+  - Aggregate GPU kernel-time split across both devices in those steady
+    windows:
+    - F16 dense GEMV/GEMM: `234.561 ms`, `36.86%`, `8.088 ms` aggregate per
+      token.
+    - AWQ MoE expert path: `131.876 ms`, `20.72%`, `4.547 ms` aggregate per
+      token.
+    - TP custom all-reduce: `55.456 ms`, `8.71%`, `1.912 ms` aggregate per
+      token.
+    - GDN/linear-attention decode: `54.302 ms`, `8.53%`, `1.872 ms` aggregate
+      per token.
+    - Elementwise/cache/misc: `44.928 ms`, `7.06%`, `1.549 ms` aggregate per
+      token.
+    - Flash-V100 decode attention: `37.756 ms`, `5.93%`, `1.302 ms` aggregate
+      per token.
+    - MoE router top-k: `27.801 ms`, `4.37%`, `0.959 ms` aggregate per token.
+    - RMSNorm: `21.994 ms`, `3.46%`, `0.758 ms` aggregate per token.
+    - MoE activation: `9.562 ms`, `1.50%`, `0.330 ms` aggregate per token.
+    - memcpy/memset: `7.957 ms`, `1.25%`, `0.274 ms` aggregate per token.
+    - NCCL collective tail: `1.091 ms`, `0.17%`.
+  - Per-device split was balanced:
+    - Device 0 total aggregate kernel time `317.052 ms` (`10.933 ms` per
+      token): F16 dense `36.68%`, AWQ MoE expert `20.78%`, TP custom
+      all-reduce `9.17%`, GDN `8.39%`, elementwise/cache `6.90%`,
+      Flash-V100 decode attention `5.95%`.
+    - Device 1 total aggregate kernel time `319.277 ms` (`11.010 ms` per
+      token): F16 dense `37.04%`, AWQ MoE expert `20.67%`, GDN `8.68%`, TP
+      custom all-reduce `8.26%`, elementwise/cache `7.22%`, Flash-V100 decode
+      attention `5.92%`.
+  - Largest individual steady-decode kernels:
+    - `turbomind::gemm::gemm_kernel` for AWQ MoE expert GEMM:
+      `81.317 ms` aggregate, `2.804 ms` per token.
+    - `gemv2T_kernel_val` F16 GEMV variants:
+      `81.146 ms`, `39.229 ms`, `27.738 ms`, and `12.277 ms` aggregate
+      buckets.
+    - `vllm::cross_device_reduce_1stage<half, 2>`:
+      `50.594 ms`, `1.745 ms` per token.
+    - Flash-V100 decode partition/reduce:
+      `33.714 ms` and `4.042 ms`.
+    - `awq_moe_single_token_prepare_kernel`: `31.601 ms`.
+    - `vllm::moe::topkGating`: `27.801 ms`.
+    - GDN decode kernels such as `triton_per_fused_1`,
+      `fused_sigmoid_gating_delta_rule_update_kernel`, and
+      `_causal_conv1d_update_kernel`: together a meaningful but secondary
+      bucket.
+- Interpretation:
+  - For 35B-A3B-AWQ TP2 decode, the main bottleneck is the combined model
+    compute path: F16 dense GEMV/GEMM plus AWQ MoE expert execution is about
+    `57.6%` of stable decode GPU kernel time. This is the primary optimization
+    target.
+  - TP custom all-reduce (`~8.7%`), GDN/linear-attention decode (`~8.5%`),
+    elementwise/cache small kernels (`~7.1%`), and Flash-V100 decode attention
+    (`~5.9%`) are secondary. Attention alone is not the dominant 35B-AWQ
+    bottleneck on this same-criterion compile-graph profile.
+  - The next implementation pass should focus on reducing F16 GEMV/GEMM count
+    and AWQ MoE single-token expert overhead, especially TurboMind expert GEMM,
+    `awq_moe_single_token_prepare`, F16 GEMV dispatch, and the surrounding
+    per-layer small-kernel pattern. All-reduce and GDN are follow-up targets
+    after the model-compute bucket is reduced.
+
+2026-06-20 Qwen3.6-35B-A3B-AWQ TP2 Nsight Compute resource utilization:
+
+- Tool and safety constraints:
+  - Nsight Systems GPU metrics are not available for the V100/Tesla PG503-216
+    devices in this workstation, so SM/DRAM utilization must come from Nsight
+    Compute counters.
+  - Nsight Compute requires privileged performance-counter access on this host
+    (`RmProfilingAdminOnly=1`). The valid NCU reports below were collected as
+    root against isolated microbenchmarks on otherwise-free V100s.
+  - Root CUDA device ordering must be pinned with
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Earlier dense GEMV trial reports without
+    that env selected the RTX 4060 Ti (`CC 8.9`) as CUDA device 0 and are not
+    valid V100 evidence. Only reports with `CC 7.0` are used below.
+  - Full-model NCU worker profiling of the 35B TP2 decode path failed during
+    NCU kernel replay. TP custom all-reduce microbench profiling also hung in
+    kernel/application replay for
+    `vllm::cross_device_reduce_1stage<half, 2>`. Keep using the nsys time
+    split for all-reduce until an NCU `range`/`app-range` method is proven.
+- V100 Nsight Compute artifacts:
+  - Summary:
+    `bench_results/nsight_35b_awq_tp2_20260620/ncu/sol_summary_v100.json`.
+  - AWQ MoE production GEMM:
+    `micro_v100_35b_awq_moe_layer1_legacy_single_token_gemm_rawdram.ncu-rep`
+    and `_details.csv`; SpeedOfLight report
+    `micro_35b_awq_moe_layer1_legacy_single_token_gemm_sol.ncu-rep`.
+  - F16 hidden projection GEMV:
+    `micro_v100_f16_gemv_hidden2048_out2048_sol.ncu-rep`,
+    `micro_v100_f16_gemv_hidden2048_out2048_rawdram.ncu-rep`, and CSV
+    exports.
+  - F16 large vocab/lm-head GEMM:
+    `micro_v100_f16_gemm_hidden2048_out151936_sol.ncu-rep`,
+    `micro_v100_f16_gemm_hidden2048_out151936_rawdram.ncu-rep`, and CSV
+    exports.
+- Resource utilization results:
+  - F16 hidden GEMV, shape `1x2048 @ 2048x2048`, V100 `gemv2T_kernel_val`:
+    mean SpeedOfLight duration `19.2 us`, SM throughput `22.5%`, DRAM
+    throughput `38.8%`. Raw DRAM pass measured `9.77 MB`, `509.8 GB/s`,
+    `50.9%` of sustained peak, SM throughput `23.1%`. NCU flagged the grid
+    as small: `(256, 1, 1)` blocks, about `0.4` full waves across SMs.
+  - F16 large vocab/lm-head GEMM, shape `1x2048 @ 2048x151936`, V100 CUTLASS
+    `cutlass_70_wmma_tensorop_f16...gemm`: mean duration `635.7 us`, SM
+    throughput `25.8%`, DRAM throughput `86.4%`. Raw DRAM pass measured
+    `624.0 MB`, `981.0 GB/s`, `87.0%` of sustained peak. This is already a
+    high-bandwidth kernel; kernel micro-tuning has limited headroom compared
+    with avoiding or reducing the call/output work.
+  - AWQ MoE production `legacy_single_token_compact` TurboMind GEMM for layer
+    1, `top_k=8`, `experts=256`, `hidden=2048`, `moe_intermediate=512`:
+    - W13/gate-up launch grid `(9, 8, 8)`: duration `33.57 us`, `9.41 MB`
+      DRAM, `280.2 GB/s`, DRAM `23.9%`, SM `28.6%`.
+    - W2/down launch grid `(9, 16, 4)`: duration `23.04 us`, `4.54 MB` DRAM,
+      `196.9 GB/s`, DRAM `17.5%`, SM `27.9%`.
+    - The later 64-block GEMMs in the exactness microbench are reference-check
+      kernels, not the production compact path, and must not be used to infer
+      end-to-end decode utilization.
+- Interpretation:
+  - The F16 dense bucket is bandwidth-oriented. The large vocab/lm-head GEMM
+    is already at about `87%` sustained DRAM peak on V100, while smaller
+    hidden GEMVs are partly small-grid limited and still consume hundreds of
+    GB/s. The best speed lever is reducing dense calls or the amount of dense
+    output work, especially logits/lm-head work, not expecting a large gain
+    from retuning the existing cuBLAS/CUTLASS kernels.
+  - The AWQ MoE expert GEMM bucket is not bandwidth saturated and not close to
+    peak SM throughput. It is dominated by small single-token expert shapes and
+    surrounding metadata/launch work. There is still optimization room, but it
+    is more likely in packing/fusion/launch reduction and
+    `awq_moe_single_token_prepare`/router metadata flow than in pure GEMM math
+    micro-tuning alone.
+  - Combining the nsys time split with NCU counters: 35B-AWQ TP2 decode is
+    mainly split between a high-bandwidth F16 dense path (`36.9%` of stable
+    decode GPU time) and an under-occupied AWQ MoE path (`20.7%`). TP
+    all-reduce remains a secondary `8.7%` time bucket, but its hardware
+    counters are still blocked by NCU replay behavior.
+
+2026-06-20 Mirage/MPK feasibility check for 35B-AWQ SM70 decode:
+
+- Local repo `/home/ymzx/桌面/1cat-vllm/mirage`, branch `mpk`, was built in a
+  local overlay venv `.venv-1cat-mirage` with the conda 1.2.0 Python/Torch
+  environment as system site packages. The venv is only for this feasibility
+  check and should not be treated as part of the vLLM runtime.
+- Temporary SM70-enablement patches were needed before Mirage would import or
+  attempt JIT on V100:
+  - add CUDA architecture `70` to `CMakeLists.txt`;
+  - add V100 shared-memory capacity (`96 KiB`) in `python/mirage/utils.py`;
+  - relax the generic transpiler guard in `src/transpiler/transpile.cc` from
+    A100+ to V100+.
+- After rebuilding, `python/mirage/core.cpython-312-x86_64-linux-gnu.so`
+  contains `sm_70` cubins and `import mirage` succeeds on V100
+  (`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0`). `PersistentKernel`
+  is importable, but that is not sufficient evidence for MPK runtime support.
+- Generic elementwise JIT reaches nvcc on V100 only after explicitly marking
+  outputs. A two-output add/exp smoke returned two tensors; the `exp` result
+  matched torch while the add-chain result did not, so even the generic path is
+  not yet a production-quality SM70 route.
+- Follow-up SM70 threadblock patches unblocked the generic customized matmul
+  path on V100:
+  - `src/transpiler/transpiler_tb.cc` now selects the CuTe Volta atom
+    `SM70_8x8x4_F16F16F16F16_TN` for fp16 customized matmul and throws a
+    runtime error instead of relying on release-dead `assert(0)` for unsupported
+    architectures.
+  - `include/mirage/transpiler/runtime/threadblock/matmul.h` now has an
+    `IS_LDMATRIX_AVAIL=false` selector path and bypasses the SM75+
+    `ldmatrix`/all-zero-fragment branch for SM70 universal shared-to-register
+    copies.
+- V100 GPU0 evidence with `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0`:
+  - Small customized matmul `(8,64) @ (64,64)`, generated `file_id=7003`:
+    `compile done True`, `valid True`, output shape `(8,64)`, `max_abs
+    0.001953125`, `bad 0 / 512` under the existing `1e-1` mismatch rule.
+  - Gated-MLP shape from `tests/python/test_tensor_program.py::test_gated_mlp`
+    (`8x4096`, two `4096x4096` weights, grid `(64,1,1)`, block `(128,1,1)`,
+    forloop `64`) generated `file_id=7004` and compiled/ran. The original test
+    input scale overflows fp16 outputs to `inf`, so that run is only route
+    evidence, not numeric quality evidence.
+  - Same gated-MLP shape with scaled weights, generated `file_id=7005`: finite
+    outputs, output shape `(8,4096)`, `max_abs 1.15625`, `max_rel 0.0198`,
+    `bad 0 / 32768` under the existing Mirage test criterion.
+  - The official `pytest` wrapper was not run because the local overlay venv
+    does not include `pytest`; the test body above was run directly.
+- Updated status: Mirage generic customized fp16 matmul/gated-MLP is no longer
+  blocked by the SIGFPE/SM75 `ldmatrix` issue on V100. This is still not MPK or
+  a Qwen/vLLM integration result, and it is not 35B-AWQ decode speed evidence.
+- MPK is also not plug-and-play for V100: `python/mirage/mpk/persistent_kernel.py`
+  registers linear tasks only for SM80, SM90, and SM100 families, and raises
+  unsupported compute capability below 80 for these linear task paths.
+- A V100 MPK `test_mode` linear compile probe confirmed this is a real CUDA
+  task blocker, not just an overly strict Python guard. The probe used
+  `B=8,K=128,N=128`, bypassed the registration guard only long enough to
+  register the existing `"linear"` task, then compiled with real `target_cc=70`
+  and `-arch=native` on V100. `ptxas` failed on the current Ampere task with:
+  `Feature 'ldmatrix' requires .target sm_75 or higher`, `Feature '.bf16'
+  requires .target sm_80 or higher`, and `Feature '.m16n8k16' requires .target
+  sm_80 or higher`.
+- Implication: do not widen MPK linear guards to include SM70 without a new
+  SM70 task implementation. The V100 path needs fp16 Volta MMA/HMMA codegen and
+  non-`ldmatrix` shared-to-register movement, or a wrapper around the now-working
+  generic customized SM70 matmul path.
+- Decision: Mirage is relevant as a design direction (persistent/fused MoE
+  scheduling), and basic SM70 customized matmul now looks feasible. The next
+  Mirage-specific step must be MPK task support or a small Qwen/AWQ expert
+  prototype on V100, behind a default-off path, before comparing decode speed.
+
+2026-06-20 Mirage MPK SM70 linear bring-up:
+
+- Added a first V100-specific MPK linear route in the Mirage working tree:
+  `include/mirage/persistent_kernel/tasks/sm70/linear_sm70.cuh`,
+  `TaskRegister::register_linear_sm70_task`, `Graph::register_task("linear_sm70")`,
+  and a `PersistentKernel.linear_layer` branch for `target_cc == 70`. This is a
+  scalar fp16 correctness/route kernel with fp32 accumulation; it is not meant
+  to represent final decode performance.
+- Rebuilt Mirage successfully with the conda 1.2.0-backed overlay venv. The
+  local machine does not have `clang-format` on `PATH`, so formatting was
+  limited to matching the surrounding style by hand.
+- V100 compile smoke used
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2`, `B=8,K=128,N=128`,
+  `MIRAGE_USE_CUTLASS_KERNEL=0`, `target_cc=70`, and `-arch=native`. The
+  generated MPK launcher compiled successfully and saved artifacts under
+  `/home/ymzx/桌面/1cat-vllm/mirage/generated_mpk_sm70_linear_smoke_1w1s/`.
+- Generated-code evidence:
+  `generated_mpk_sm70_linear_smoke_1w1s/test_rank0.cu` dispatches only
+  `kernel::linear_sm70_kernel<8, 64, 128, 128>` for the two output-column
+  tiles. Searches over the generated CUDA found no `ldmatrix`, `.bf16`,
+  `m16n8k16`, `cp.async`, or `mma.sync` instructions in the SM70 linear path.
+- Two V100 MPK runtime blockers were fixed:
+  - `include/mirage/persistent_kernel/runtime_header.h` now caps SM70 dynamic
+    shared memory at `96 KiB - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE`.
+    Before this, the worker kernel requested `163840` bytes dynamic shared
+    memory and never actually entered on V100. After the fix the launcher
+    prints `smem size: 95232`.
+  - `include/mirage/persistent_kernel/tasks/common/copy_sm80.cuh` now has a
+    non-`cp.async` fallback for `load_smem()` and
+    `load_smem_with_predict()`. Before this, SM70 compiled the functions as
+    empty bodies, so workers fetched task ids but copied no `TaskDesc` data
+    into shared memory.
+- Runtime correctness evidence on V100 GPU2:
+  - Minimal verbose smoke `B=1,K=8,N=64`, `num_workers=1`,
+    `num_local_schedulers=1`: worker fetched begin task, triggered the launch
+    event, executed `TASK_LINEAR`, triggered end-of-graph, and returned.
+  - `B=8,K=128,N=128`, `num_workers=1`, `num_local_schedulers=1`:
+    `max_abs=0.0`, `max_rel=0.0`, `bad 0 / 1024`,
+    `SM70_MPK_LINEAR_SMOKE_PASS`.
+  - Same `B=8,K=128,N=128` with default V100
+    `mirage.get_configurations_from_gpu(0)` output
+    `64` workers and `32` schedulers: `max_abs=3.814697265625e-06`,
+    `bad 0 / 1024`, `SM70_MPK_LINEAR_DEFAULT_CFG_PASS`.
+  - Qwen hidden-size smoke `B=8,K=4096,N=4096`, default `64/32`
+    worker/scheduler config: `max_abs=7.62939453125e-06`,
+    `max_rel=0.0009661835501901805`, `bad 0 / 32768`,
+    `SM70_MPK_LINEAR_QWEN_SHAPE_PASS`.
+- Updated status: a minimal SM70 MPK fp16 linear route is now compiled,
+  scheduled, executed, and numerically correct on V100. It is deliberately a
+  scalar fp32-accumulation correctness kernel, not performance evidence. The
+  next Mirage step should replace `linear_sm70_kernel` with a Volta HMMA-backed
+  implementation or wrap the already-working generic SM70 customized matmul
+  path, then compose gate/up + activation + down/expert routing before any
+  35B-AWQ decode comparison.
+
+2026-06-20 Mirage MPK SM70 WMMA/HMMA linear prototype:
+
+- Replaced the default `linear_sm70_kernel` path with a Volta WMMA implementation
+  for shapes where `OUTPUT_SIZE` and `REDUCTION_SIZE` are multiples of 16. The
+  scalar fp32-accumulation implementation remains as a fallback and can be
+  forced with `-DMIRAGE_SM70_LINEAR_FORCE_SCALAR` for local A/B checks.
+- Because the WMMA prototype adds roughly 6 KiB of static shared memory per
+  worker block, SM70 `WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE` was raised from
+  `3 KiB` to `16 KiB`. Without this, the worker launch silently exceeded V100's
+  total shared-memory limit and test-mode hung after scheduler launch. After
+  the fix, launch prints `smem size: 81920`.
+- V100 GPU2 correctness and route evidence:
+  - `B=8,K=128,N=128`, `num_workers=1`, `num_local_schedulers=1`:
+    `max_abs=9.5367431640625e-07`, `max_rel=0.0006802721181884408`,
+    `bad 0 / 1024`, `SM70_MPK_LINEAR_WMMA_SMOKE_PASS`.
+  - `B=8,K=4096,N=4096`, default V100 `64/32` worker/scheduler config:
+    `max_abs=1.52587890625e-05`, `max_rel=0.0009643201483413577`,
+    `bad 0 / 32768`, `SM70_MPK_LINEAR_WMMA_QWEN_SHAPE_PASS`.
+  - `cuobjdump --dump-sass` on
+    `generated_mpk_sm70_linear_wmma_qwen_shape/mpk_launcher_rank0...so`
+    shows `HMMA.884.F32.F32.STEP*` instructions. The scalar-forced B=1 build
+    shows `FFMA.FTZ` and no HMMA in the sampled lines, so the default path is
+    genuinely using Volta tensor cores.
+- Rough test-mode timing, measured with CUDA events around `pk.run_test_mode()`
+  and therefore including worker/scheduler launch overhead:
+  - `B=8,K=4096,N=4096`, default config: WMMA median
+    `0.06144 ms`; scalar-forced median `0.06554 ms`.
+  - `B=1,K=4096,N=4096`, default config: WMMA median
+    `0.06042 ms`; scalar-forced median `0.07066 ms`.
+  These timings are useful only as route sanity checks. They are not steady-state
+  persistent-kernel decode latency and should not be compared directly to vLLM
+  decode buckets.
+- Nsight Compute status: `ncu` is installed, but perf counters require sudo
+  (`ERR_NVGPUCTRPERM`). Running NCU under sudo on the generated persistent
+  `worker_kernel` attached successfully, but a narrow metric run did not return
+  after more than three minutes and was interrupted by this Codex session. For
+  actionable Nsight metrics, the next step should profile a non-persistent SM70
+  wrapper for `linear_sm70_kernel` or add a single-worker single-task benchmark
+  kernel, then collect tensor/DRAM/SM metrics there before re-entering full MPK.
+- Interpretation: the current WMMA prototype proves that Mirage MPK can execute
+  Volta HMMA inside its worker runtime, but it is still a naive padded 16x16x16
+  tile. For decode `B=1`, it overcomputes inactive rows; for MoE expert routing,
+  real gains likely require an 8x8x4 Volta MMA/CuTe route or a grouped GEMV/MoE
+  kernel that avoids padding each active-token/expert group to 16 rows.
+
+2026-06-20 27B DFlash16 baseline and Qwen GDN verifier diagnostic:
+
+- User-facing DFlash follow-up switched back to the 27B route:
+  target `/home/ymzx/models/Qwen3.6-27B-AWQ`, draft
+  `/home/ymzx/models/Qwen3.6-27B-DFlash-FP16`, TP2 on GPUs `2,3`,
+  `FLASH_ATTN_V100`, input/output `4096/256`, `max_model_len=8192`,
+  `max_num_seqs=1`, `gpu_memory_utilization=0.75`, and compile graph policy
+  `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`.
+- Same-condition no-DFlash baselines:
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_nospec_i4096_o256_greedy_mnbt8192.json`
+  measured `steady_decode_tps=55.86159315981125`,
+  `output_tps=38.157589777387116`, `decode_time=4.564853695999773`, and
+  token hash
+  `d547323c0838e3d5a5a8ef26bd3dcfb475ca39ba25299c96269988bd610b05b4`.
+  Official sampling
+  (`temperature=1.0`, `top_p=0.95`, `top_k=20`) in
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_nospec_i4096_o256_official.json`
+  measured `steady_decode_tps=54.52313941993402`,
+  `output_tps=37.543986110681736`, and `decode_time=4.6769133749985485`.
+- Target DFlash16 with the quality-safe default GDN route
+  (`VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`) matched the no-DFlash greedy token
+  hash but remained much slower:
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_dflash16_i4096_o256_greedy_mnbt8192.json`
+  measured `steady_decode_tps=34.50339715311688`,
+  `output_tps=26.31825652614825`, `decode_time=7.39057661100378`,
+  `acceptance_length=4.642857142857142`, and
+  `overall_acceptance_rate=0.22767857142857142`. Per-position acceptance
+  was `[0.75, 0.5892857142857143, 0.42857142857142855,
+  0.3392857142857143, 0.30357142857142855, 0.25,
+  0.19642857142857142, 0.14285714285714285, 0.14285714285714285,
+  0.10714285714285714, 0.10714285714285714, 0.10714285714285714,
+  0.05357142857142857, 0.05357142857142857, 0.03571428571428571,
+  0.03571428571428571]`.
+- Target DFlash16 with the experimental GDN spec-core route
+  (`VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`) is not an acceptable fix:
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_dflash16_i4096_o256_greedy_mnbt8192_spec_core.json`
+  measured `steady_decode_tps=30.82382861238035`,
+  `output_tps=24.42782158391625`, `decode_time=8.272820459998911`,
+  `acceptance_length=4.112903225806452`, and
+  `overall_acceptance_rate=0.19455645161290322`. The greedy token hash changed
+  to `f08998aa82b1a2c45d68c56b2b315c156950c8f6616dcf52ffe02f10202a1fbc`,
+  so the route is not quality-safe. It is also slower than the quality-safe
+  full-GDN K16 route in this same benchmark (`30.82` vs `34.50 tok/s` steady).
+- Target DFlash16 official-sampling run:
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_dflash16_i4096_o256_official_mnbt8192.json`
+  measured `steady_decode_tps=27.732380043828957`,
+  `output_tps=22.182167437673982`, `decode_time=9.195027603003837`,
+  `acceptance_length=3.6956521739130435`, and
+  `overall_acceptance_rate=0.16847826086956522`. Per-position acceptance
+  was `[0.7681159420289855, 0.5507246376811594, 0.3188405797101449,
+  0.2028985507246377, 0.17391304347826086, 0.14492753623188406,
+  0.11594202898550725, 0.10144927536231885, 0.08695652173913043,
+  0.043478260869565216, 0.043478260869565216, 0.028985507246376812,
+  0.028985507246376812, 0.028985507246376812, 0.028985507246376812,
+  0.028985507246376812]`.
+- The DFlash16 route hit the intended implementation rather than falling back:
+  runtime logs showed `SM70 Qwen GDN full-forward route enabled` and
+  `FLASH_ATTN_V100 prefix prefill small-query path active` for the paged decode
+  verifier with `max_query_len<=17`.
+- A short DFlash16 profiling run was added only to understand proposer shape,
+  not as speed evidence:
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_dflash16_i4096_o64_greedy_profile.json`
+  used `VLLM_DFLASH_PROFILE=1`, `VLLM_DFLASH_PROFILE_LOG_INTERVAL=1`, and
+  output length `64`. The first DFlash round saw `avg_context_tokens=4096.0`,
+  `avg_query_tokens=17.0`, `avg_padded_query_tokens=17.0`, and
+  `avg_padding_ratio=1.00`; by round 14 the cumulative average context had
+  fallen to `308.4`, which means rounds after the first were adding about
+  `17` context tokens each. The expand kernel itself was about `1.1 ms` on the
+  first round and the cumulative average fell to about `0.32 ms`. Therefore the
+  steady-state DFlash16 slowdown is not caused by repeatedly rebuilding the
+  whole 4096-token context or by query padding. It is primarily the K16
+  verifier/draft forward cost plus low accepted tokens per verifier step.
+- DFlash4 was run only as a verifier diagnostic; it is not the target DFlash
+  route for this 27B pass. The quality-safe DFlash4 artifact
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_dflash4_i4096_o256_greedy_mnbt8192.json`
+  measured `steady_decode_tps=31.241806491665965`,
+  `output_tps=24.415495104858064`, `decode_time=8.162140050000744`,
+  `acceptance_length=3.619718309859155`,
+  `overall_acceptance_rate=0.6549295774647887`, and per-position acceptance
+  `[0.8169014084507042, 0.7464788732394366, 0.5774647887323944,
+  0.4788732394366197]`.
+- Diagnostic DFlash4 with `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1` confirmed the
+  GDN verifier boundary is a real speed lever, but it is not quality-safe:
+  `bench_results/dflash_27b_k_sweep_20260620/27b_awq_dflash4_i4096_o256_greedy_mnbt8192_spec_core.json`
+  measured `steady_decode_tps=40.45253741527725`,
+  `output_tps=29.714629089653453`, `decode_time=6.303683681995608`,
+  `acceptance_length=4.413793103448276`, and
+  `overall_acceptance_rate=0.853448275862069`, but the token hash changed to
+  `987cacf38cf7239d324345d8c0c6028692e78d0730ebe48caa06663be89abd21`.
+  Do not default-enable this gate from speed alone, and do not extrapolate the
+  K4 speed behavior to K16.
+- DFlash4 official-sampling attempts did not produce an accepted artifact in
+  this pass: the first
+  `max_num_batched_tokens=4096` run hit a CUDA device-side assert, and the
+  `8192` cap retry died after an active DFlash request reached roughly
+  186 output tokens. Since DFlash16 is the target route, do not spend the next
+  pass stabilizing DFlash4 before the K16 verifier bottleneck is addressed.
+- Interpretation:
+  - K16 is active and exact under greedy with the full-GDN verifier, but it is
+    not accelerating yet: `34.50 tok/s` greedy and `27.73 tok/s` official are
+    both well below the matched no-DFlash references (`55.86` and `54.52
+    tok/s` steady decode).
+  - The immediate blocker is not whether DFlash can be enabled at K16. The
+    blocker is the combination of low long-position acceptance and expensive
+    quality-safe full-GDN verification.
+  - The existing GDN spec-core route remains a failed K16 candidate: it changes
+    the greedy token hash and is slower than full-GDN at K16 in this benchmark.
+    DFlash should not inherit that route as a default until the spec-core state
+    snapshot/commit semantics match the full-GDN reference and a same-K16 speed
+    run shows an actual win.
+  - The next DFlash speed pass should focus on a quality-safe narrow GDN spec
+    verifier boundary and full-GDN verifier overhead reduction on K16. Also
+    inspect draft/target distribution mismatch for official sampling, where
+    acceptance falls to `0.1685` overall.
+  - External DDTree/Diffusion Draft Tree work exists and targets this exact
+    vanilla-DFlash limitation by constructing a draft tree from the DFlash
+    block distribution and verifying the tree with an ancestor-only attention
+    mask. This repository currently has no DDTree/DTree implementation or flag;
+    treating it as a local switch would be wrong. A local DDTree port would be
+    a new verifier/tree-attention implementation, not a config tweak.
+  - Do not spend another pass sweeping smaller DFlash K values or treating
+    DDTree/DTree as a local drop-in flag; this repository does not currently
+    contain a local DDTree/DTree DFlash implementation.
+
+## 2026-06-20 Qwen3.6-27B-AWQ TP2 TileRT-Style Runtime Direction
+
+- New design note: `docs/design/sm70_tile_runtime_exploration.md`.
+- Public TileRT source inspection found that the open repository exposes the
+  Python/wheel interface and high-level execution model, not the core runtime
+  source. The actionable local direction is therefore to reproduce the idea:
+  tile-level tasks, persistent or long-lived device-side scheduling, and
+  compute/IO/communication overlap inside a narrow TP2 boundary.
+- The first target remains TurboMind-only, not Marlin: row-parallel AWQ GEMM
+  followed by TP2 hidden-state all-reduce.
+- New offline ranker: `benchmarks/rank_sm70_tile_runtime_candidates.py`.
+  Running it on today's
+  `27b_awq_tp2_i512_o128_currentgraph_nsys.sqlite` produced:
+  `tile_runtime_candidate_ranking_i512_o128_currentgraph.json` and `.md`.
+- Highest-value candidates:
+  - device 0, AWQ GEMM `grid=1x20x7`: `62.896` calls/token,
+    `775.813 us/token` all-reduce after the GEMM, `2406.688 us/token` in the
+    preceding GEMM, `140` CTAs, eligible for an 80-SM V100 tile-overlap
+    experiment.
+  - device 0, AWQ GEMM `grid=1x40x12`: `62.968` calls/token,
+    `755.913 us/token` all-reduce after the GEMM, `1742.154 us/token` in the
+    preceding GEMM, `480` CTAs, also eligible.
+  - device 1 shows the same ordering with `732.124 us/token` and
+    `710.721 us/token` all-reduce after those two GEMM grids.
+- Interpretation: the first TileRT-style implementation should not split
+  all-reduce into many launched chunk kernels. The chunk diagnostic already
+  showed 5120 fp16 TP2 all-reduce worsening from `~13.21 us` for one chunk to
+  `~19.97 us` for two chunks and `~66.55 us` for eight chunks. The viable path
+  is a fused/chunk-aware worker or GEMM epilogue tile-ready protocol.
+- First implementation milestone: M=1, fp16 output, TP2, output hidden size
+  5120, TurboMind AWQ GEMM epilogue publishes coarse N-tile-ready flags; one
+  fused or long-lived TP2 reduce worker consumes those tiles and writes the
+  normal vLLM output layout. Acceptance requires token-hash parity and an nsys
+  trace showing the target GEMM/all-reduce boundary is no longer strictly
+  serialized.
+
+### Phase 0 tile runtime skeleton
+
+- Implemented a standalone TP2 tile-runtime prototype that does not affect the
+  decode path:
+  - `_C_custom_ar.tile_runtime_all_reduce`
+  - `CustomAllreduce.tile_runtime_all_reduce`
+  - `benchmarks/benchmark_sm70_tile_runtime.py`
+- The kernel is a single-launch persistent CTA pool. Each tile task copies the
+  local tile to a peer-visible staging buffer, publishes a tile-ready flag via
+  the existing custom-AR signal memory, waits for peer tile flags, and reduces
+  peer staging tiles into the output.
+- Build/install completed for `_C.abi3.so`.
+- TP2 GPU0/1 smoke:
+  `bench_results/nsys_27b_awq_tp2_20260620/tile_runtime_proto_5120_fp16_tp2_smoke.json`
+  showed exact parity (`max_abs=0`) for all tested tile sizes.
+- TP2 GPU0/1 engine-block sweep:
+  `bench_results/nsys_27b_awq_tp2_20260620/tile_runtime_proto_5120_fp16_tp2_engineblocks.json`
+  showed:
+  - `tile_numel=5120`: about `10.7-10.8 us`, `max_abs=0`.
+  - `tile_numel=2560`: about `12.35-12.45 us` with enough worker blocks,
+    `max_abs=0`.
+  - `tile_numel=1024`: about `12.07-12.13 us` with enough worker blocks,
+    `max_abs=0`.
+  - `tile_numel=512`: about `12.22 us` with `engine_blocks=0`, but about
+    `65.5 us` with only one worker block.
+- Interpretation: the substrate works and remains in the same latency class as
+  optimized custom AR for coarse tiles. Fine tiles need enough resident worker
+  CTAs and still expose flag/scheduling overhead. The next step should replace
+  the synthetic producer copy with TurboMind AWQ tile production rather than
+  making the tile size smaller.
+
+### Phase 1 role-specialized tile engine
+
+- Added a second experimental custom-AR op that follows the public TileRT
+  block-specialization direction more closely:
+  - `_C_custom_ar.tile_runtime_all_reduce_engine`
+  - `CustomAllreduce.tile_runtime_all_reduce_engine`
+  - `benchmarks/benchmark_sm70_tile_runtime.py --modes engine`
+- The new kernel separates producer CTAs from reducer CTAs in one CUDA
+  graph-compatible launch. Producer CTAs write local tiles into the registered
+  peer-visible staging buffer and publish tile-ready flags. Reducer CTAs wait
+  for peer tile flags and reduce those staged tiles into the output.
+- Build/install completed for `_C.abi3.so`; Python schema check confirmed
+  `torch.ops._C_custom_ar.tile_runtime_all_reduce_engine`.
+- TP2 GPU0/1 validation artifacts:
+  - `tile_runtime_engine_phase1_5120_fp16_tp2_smoke.json`
+  - `tile_runtime_engine_phase1_5120_fp16_tp2_rolesweep.json`
+  - `tile_runtime_engine_phase1_5120_fp16_tp2_inline_baseline_1000.json`
+- Correctness: all tested modes reported `max_abs=0`.
+- Same-replay 5120-fp16 TP2 baseline:
+  - inline prototype, `tile_numel=5120`: about `11.41 us`.
+  - role engine, `tile_numel=5120`: best observed about `12.27 us`.
+  - role engine, `tile_numel=2560`: best observed about `12.82 us`.
+- Interpretation: this is not a standalone AR-speed win. It pays extra CTA and
+  flag overhead when the producer is only a synthetic copy. Its value is that
+  the local code now has the official-style role-separated producer/reducer
+  protocol needed to connect TurboMind AWQ tile production and test real
+  GEMM/communication overlap.
+
+## 2026-06-21 27B-AWQ DFlash DDTree Reference Capture
+
+- New design note: `docs/design/sm70_dflash_ddtree_27b_awq_plan.md`.
+- Cloned two public DDTree references under `third_party/ddtree_refs/`:
+  - `official_ddtree` at `c96427a185677bf4133ed865dd1626a5041aef9b`,
+    MIT license.
+  - `aeon_qwen36_ddtree` at `d2610ae5e42ddcbccbf8cd800c67644d3c7843f6`,
+    Apache-2.0 license.
+- Decision: use both repositories as references, not drop-in dependencies.
+  The official implementation gives the algorithmic tree builder/verifier walk;
+  AEON gives a useful vLLM/Qwen3.6 integration map and tests. Neither is a
+  production-ready V100/vLLM DDTree route.
+- Local DDTree work should start with pure tree builder/metadata tests and a
+  `dflash_ddtree` flat-fallback alias before touching scheduler, sampler,
+  Flash-V100 verifier, or Qwen GDN state commit code.
+- M1 is now present locally:
+  - `vllm/v1/spec_decode/ddtree_tree.py`
+  - `vllm/v1/spec_decode/ddtree_metadata.py`
+  - `tests/v1/spec_decode/test_ddtree_tree.py`
+  - `tests/v1/spec_decode/test_ddtree_metadata.py`
+- M2 flat-fallback entry is also present:
+  - `method="dflash_ddtree"` is accepted by `SpeculativeConfig`.
+  - `DFlashProposer` accepts both `dflash` and `dflash_ddtree`.
+  - `ddtree_budget`, `ddtree_top_k`, `ddtree_chain_seed`, and
+    `ddtree_disable_tree_verify` are recorded, with tree verification disabled
+    by default.
+- Validation completed in the `1cat-vllm-1.2.0-releasecheck` conda env by
+  directly running the new assert tests because that env does not currently
+  have `pytest` installed. Targeted `ruff check` and `py_compile` also passed
+  for the touched DDTree/DFlash/config files.
+- M3 payload-only path is now present:
+  - `vllm/v1/spec_decode/ddtree_payload.py` builds per-request
+    `DDTreeDraftPayload` objects from the DFlash first-pass logits and reuses
+    the local `build_ddtree()` helper.
+  - `DFlashProposer` overrides `_sample_draft_tokens()` for
+    `method="dflash_ddtree"` so the same logits block feeds both current flat
+    draft sampling and DDTree payload construction.
+  - `GPUModelRunner` caches the latest payload out-of-band via
+    `take_dflash_ddtree_payloads()`. Scheduler output, `DraftTokenIds`, and
+    rejection sampling remain unchanged.
+  - Validation covered `top_k=1` flat-chain parity and `top_k=2` sibling branch
+    construction with direct assert tests, plus targeted ruff/py_compile.
+- Next step is M4/M5 correctness: consume this payload in a verifier prototype
+  without committing rejected Qwen3.6 GDN state. The current payload path
+  materializes top-k/logprob data to CPU and is not yet a performance path.
+- M4 helper path has started:
+  - `tree_from_payload()` reconstructs `DDTree` from a `DDTreeDraftPayload`.
+  - `vllm/v1/spec_decode/ddtree_verify.py` provides metadata construction,
+    prompt-plus-tree attention verifier inputs, and greedy verification from
+    compact root-plus-node logits.
+  - Tests cover full-chain accept, sibling-branch accept, payload metadata
+    rebuild, and sibling hiding in the dense attention mask.
+- Remaining M4 work is the actual target-model oracle: run a small
+  attention-only model with the prompt-plus-tree inputs and compare one-pass
+  tree logits against per-path replay before touching Qwen3.6 GDN state.
+
+## 2026-06-21 DDTree Scheduler/GDN Metadata Bridge
+
+- Implemented the first end-to-end data bridge for DDTree payloads:
+  - `DraftTokenIds.ddtree_payloads`
+  - `SchedulerOutput.scheduled_ddtree_payloads`
+  - scheduler-side per-request payload caching and strict token/payload matching
+  - worker-side payload return from `GPUModelRunner.take_draft_token_ids()`
+- Added `vllm/v1/spec_decode/ddtree_parent_metadata.py`, which converts
+  `DDTreeDraftPayload.parent_indices` into padded root-plus-tree parent-id rows
+  aligned with the active request batch.
+- Added `SpeculativeConfig.num_speculative_state_tokens()`. When
+  `method="dflash_ddtree"` and tree verify is explicitly enabled, scheduler
+  lookahead, Mamba speculative blocks, `GPUModelRunner.max_spec_state_slots`,
+  and GDN metadata buffers now size against
+  `max(num_speculative_tokens, ddtree_budget)`.
+- `GDNAttentionMetadata` now carries `ddtree_parent_ids` and
+  `ddtree_num_tree_tokens_cpu`, and existing GDN diagnostic dumps include those
+  fields.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - direct DDTree assert tests passed for config, tree, metadata, parent
+    metadata, payload, verifier helpers, and scheduler bridge.
+  - `py_compile` passed for all touched DDTree/config/scheduler/runner/GDN
+    files.
+- Environment caveat: this conda env currently lacks both `pytest` and `ruff`;
+  direct test invocation and `py_compile` were used instead.
+- This is still not a performance path. Full-attention tree visibility and
+  parent-aware Qwen3.6 GDN kernel state computation/commit remain the blocking
+  pieces before 27B-AWQ DDTree can be benchmarked as acceleration.
+
+## 2026-06-21 DDTree Attention-Only Verifier Bridge
+
+- Added greedy DDTree sampling from compact root-plus-node target logits:
+  `vllm/v1/spec_decode/ddtree_sampler.py`.
+  - It returns normal `SamplerOutput.sampled_token_ids` plus
+    `SamplerOutput.ddtree_accepted_node_indices`.
+  - `GPUModelRunner._sample()` uses it only for `dflash_ddtree` tree verify,
+    all-greedy sampling, no logprobs, no penalties, no token masks, and no
+    logits processors. Other cases fall back to the existing rejection sampler.
+- Added experimental FlexAttention DDTree logical masking:
+  - `FlexAttentionMetadata` can carry `ddtree_parent_ids` and
+    `ddtree_num_tree_tokens`.
+  - The paged mask wrapper permits history/root/self/ancestor visibility and
+    hides sibling branches.
+- Added DDTree position handling in `GPUModelRunner`:
+  - slot mapping and token-id lookup stay linear;
+  - after slot mapping, tree-node `positions` are rewritten to
+    `root_position + node_depth`.
+- Added attention-only accepted-path KV compaction:
+  - non-hybrid models copy accepted DDTree KV rows from their tree slots back
+    into the contiguous prefix slots before the next step reads cache;
+  - hybrid Qwen3.6 models remain guarded because GDN/Mamba recurrent state
+    compaction is not implemented yet.
+- Scheduler tree-row expansion now avoids partial trees and only emits a DDTree
+  payload when the scheduled rows exactly match the payload. Branched DDTree
+  scheduling is allowed only for non-hybrid models; hybrid models accept only
+  flat-chain-equivalent payloads until parent-aware GDN state commit exists.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - `py_compile` passed for scheduler, runner, outputs, DDTree sampler, and
+    FlexAttention.
+  - Direct DDTree assert tests passed for config, tree, metadata, parent
+    metadata, payload, verifier helpers, sampler, scheduler bridge,
+    FlexAttention mask, DDTree position override, and accepted KV compaction.
+- Remaining blocker for the requested 27B-AWQ route:
+  Qwen3.6 is hybrid, so true branched DDTree acceleration still requires
+  GDN/Mamba kernels to consume `ddtree_parent_ids`, compute each tree node from
+  its parent state, and commit only the accepted path. Do not benchmark hybrid
+  branched DDTree as accepted acceleration before that is implemented and
+  greedy token-hash parity is proven.
+
+## 2026-06-21 DDTree Hybrid State Guard
+
+- Tightened flat-chain detection:
+  - `DDTreeDraftPayload.is_flat_chain()` now requires verifier token ids,
+    parent ids, and node depths to be the exact linear draft chain.
+  - Scheduler fallback checking uses the same stricter semantics, so a payload
+    with matching token order but branched parent ids is rejected for hybrid
+    scheduling.
+- Added runner-side hybrid protection:
+  - `GPUModelRunner._ddtree_accepted_nodes_are_flat_prefix()` identifies
+    accepted DDTree paths that are still a normal linear prefix.
+  - `GPUModelRunner._validate_ddtree_hybrid_state_path()` runs before
+    recurrent-state postprocess and raises if a branched DDTree payload reaches
+    a hybrid model without tree-aware GDN/Mamba state support.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - `py_compile` passed for DDTree payload, scheduler, GPU runner, and the
+    focused tests.
+  - Direct assert tests passed for payload, scheduler, and GPU runner
+    DDTree position/KV/state-guard helpers.
+- This is a correctness guard, not a speed milestone. The next implementation
+  slice is still the real hybrid state path: compute each GDN/Mamba tree node
+  from `ddtree_parent_ids`, then commit only the accepted path into persistent
+  recurrent state.
+
+## 2026-06-21 DDTree State-Slot Selector Split
+
+- Added the first runner-side split between generated-token count and
+  recurrent-state slot selection for DDTree:
+  - `GPUModelRunner._ddtree_state_slot_selectors_from_accepted_nodes()` maps
+    accepted compact node indices to the selector value consumed by existing
+    hybrid state code (`selected_slot + 1`).
+  - Flat accepted paths preserve old MTP semantics: accepted nodes `[1, 2]`
+    produce selector `3`, matching the three generated output rows
+    `accepted draft 1`, `accepted draft 2`, and bonus.
+  - Branched accepted paths no longer collapse to generated-token count:
+    accepted nodes `[4, 5]` produce selector `6`, identifying compact tree
+    state slot 5.
+- `_update_states_after_model_execute()` now accepts optional
+  `ddtree_accepted_node_indices` and uses the DDTree selector when a scheduled
+  DDTree payload is present. The existing hybrid branched-payload guard still
+  runs first, so this does not yet enable unsafe Qwen3.6 branched execution.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - `py_compile` passed for `gpu_model_runner.py` and the focused DDTree GPU
+    runner test.
+  - Direct focused tests passed for DDTree position override, accepted KV
+    compaction mapping, state-slot selector, state-update selector wiring, and
+    hybrid branch guard.
+- Remaining required work is unchanged: GDN/Mamba forward kernels must compute
+  tree-node state from parent ids, and postprocess must use both the actual
+  generated-token count for block alignment and the DDTree selected state slot
+  for source-state selection.
+
+## 2026-06-21 GDN Metadata State-Selector Split
+
+- Added `GDNAttentionMetadata.spec_state_slot_selectors` and
+  `GDNSpecDecodeStateContract.spec_state_slot_selectors`.
+  - The default is still `num_accepted_tokens`, preserving the existing MTP
+    contract where accepted count and selected speculative state slot are the
+    same value.
+  - Callers may now pass `spec_state_slot_selectors` separately to
+    `build_gdn_spec_decode_state_contract()` and
+    `GDNAttentionMetadataBuilder.build()`, allowing DDTree to represent
+    generated-token count and selected compact tree state slot independently.
+  - This field is intentionally not added to `GDN_SPEC_METADATA_TENSORS` or
+    the `qwen_gdn_attention_core_spec_commit` graph-op signature yet; that
+    remains the next kernel-facing integration step.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - `py_compile` passed for `vllm/v1/attention/backends/gdn_attn.py` and the
+    focused GDN metadata test file.
+  - Direct contract checks passed for both default selector semantics and the
+    split selector case (`num_accepted_tokens=[2]`,
+    `spec_state_slot_selectors=[4]` selects state slot 13 from
+    `[10,11,12,13,14]`).
+  - Full pytest execution was not run because this releasecheck environment
+    does not currently provide `pytest`.
+- Next required step: make Qwen GDN tree-aware kernels consume both
+  `ddtree_parent_ids` and `spec_state_slot_selectors`, then split Mamba
+  postprocess inputs so block alignment can use generated-token count while
+  source-state copy uses DDTree selected slot.
+
+## 2026-06-21 Runner-to-GDN Selector Plumbing
+
+- Split the runner-side GPU buffers that feed hybrid GDN metadata:
+  - `GPUModelRunner.num_accepted_tokens` now remains the actual contiguous
+    generated-token count from `SamplerOutput.sampled_token_ids`.
+  - `GPUModelRunner.spec_state_slot_selectors` carries the state selector,
+    defaulting to the generated-token count and switching to the DDTree
+    selected compact node slot when `ddtree_accepted_node_indices` is present.
+- `_build_attention_metadata()` now passes both tensors to
+  `GDNAttentionMetadataBuilder`; Mamba2 builders still only receive the legacy
+  accepted-token count.
+- The existing hybrid branched-payload guard still runs before state update, so
+  this plumbing is inert for unsafe Qwen3.6 branches until the GDN core consumes
+  DDTree parent/state metadata.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - `py_compile` passed for GPU runner, GDN metadata, and focused tests.
+  - Direct DDTree runner tests passed, including the case where generated count
+    is `2` while the DDTree state selector is `4`.
+  - Direct GDN contract checks passed for default and split selector cases.
+
+## 2026-06-21 Qwen GDN Selector Consumption
+
+- Qwen GDN core now consumes `GDNAttentionMetadata.spec_state_slot_selectors`
+  for speculative conv/recurrent state selection:
+  - `_forward_core()` passes the selector tensor to `causal_conv1d_update()`
+    and `fused_recurrent_gated_delta_rule()` when present.
+  - `qwen_gdn_attention_core_spec_commit()` does the same for the explicit
+    spec-core graph boundary and patches metadata fallback with the selector.
+  - FULL-graph GDN metadata padding now pads `spec_state_slot_selectors`
+    alongside `num_accepted_tokens`, so live rows and graph-visible state rows
+    stay aligned.
+- This still does not implement DDTree parent-state compute. The GDN kernels
+  can now select an arbitrary compact state slot, but tree-node recurrence is
+  still processed as a linear spec sequence until `ddtree_parent_ids` is
+  consumed by the conv/GDN recurrence itself.
+- Validation in `1cat-vllm-1.2.0-releasecheck`:
+  - `py_compile` passed for GDN metadata, Qwen GDN core, GPU runner, and
+    focused test files.
+  - A direct fake-kernel `qwen_gdn_attention_core_spec_commit()` smoke verified
+    that conv/recurrent calls receive `spec_state_slot_selectors` rather than
+    `num_accepted_tokens`.
+  - Full DDTree direct tests still passed.
+
+## 2026-06-21 TurboMind AWQ MoE Weighted-Reduce Epilogue
+
+- Implemented the first TurboMind-based AWQ MoE single-token decode
+  optimization for the legacy compact route:
+  - `awq_moe_single_token_sm70_out()` now asks the prepare kernel to materialize
+    `sorted_weights` in sorted expert-row order.
+  - The W2 TurboMind dispatch uses the existing
+    `kMoeWeightedReduce` epilogue when the logical hidden output is aligned, so
+    the common Qwen3.6-35B-A3B-AWQ decode path skips the separate
+    `awq_moe_single_token_weighted_reduce_out` kernel and avoids treating
+    `sorted_output` as a required final product.
+  - If the logical hidden output is not aligned with the W2 output shape, the
+    old W2 plus standalone reduce fallback remains in place.
+- Python/runtime plumbing now carries a persistent `sorted_weights` scratch
+  buffer through the AWQ MoE layer, warmup path, and exactness harness. Callers
+  still zero the final output before invoking the fused epilogue because the
+  TurboMind reduce path accumulates into the destination.
+- Validation in `1cat-vllm-1.2.0-wheelcheck`:
+  - editable SM70 build succeeded with
+    `CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=7.0 MAX_JOBS=8`;
+  - op schema check confirmed the new `sorted_weights` argument is registered;
+  - `py_compile` passed for `_sm70_ops.py`, `awq_sm70_moe.py`,
+    `awq_sm70_warmup.py`, and `benchmark_sm70_turbomind_exactness.py`;
+  - Qwen3.6-35B-A3B-AWQ layer-1 exactness on V100 passed the op-level fp16
+    gate for both `round_robin` and `random_unique:1` expert patterns:
+    final weighted output `max_diff=7.62939453125e-06`, no sign mismatches,
+    and fused W13+SiLU bitwise exact.
+- Decode smoke caveat:
+  - A short 35B-AWQ TP2 compile-graph smoke reached model load, TurboMind MoE
+    warmup, and CUDA graph capture, then failed engine initialization during
+    graph capture without an operator stack.
+  - The same short eager smoke was terminated during checkpoint loading with
+    EngineCore `-15`.
+  - These runs are not accepted speed evidence. The next speed step must rerun
+    the matching 35B-AWQ TP2 decode case under Nsight Systems/Compute once the
+    environment can keep the engine alive, and must report pure decode
+    separately from load, TTFT, and prefill.
+
+### 2026-06-21 Nsight Follow-up for TurboMind AWQ MoE
+
+- A conservative 35B-AWQ TP2 eager smoke passed with
+  `VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1`, `--disable-custom-all-reduce`,
+  `--gpu-memory-utilization 0.70`, `--max-model-len 2048`,
+  `input_len=32`, `output_len=4`, and `warmup=0`.
+  - The run hit `SM70 AWQ MoE TurboMind batched path enabled`, TurboMind
+    warmup, and `legacy single-token monolithic compact path enabled`.
+  - It is route-hit evidence only, not speed evidence, because the accepted
+    baseline must not use this conservative/eager/no-custom-AR setup.
+- Nsight Systems on the same conservative route with `output_len=8` confirmed
+  that the standalone `awq_moe_single_token_weighted_reduce` kernel is gone.
+  The report is also not speed evidence: the no-custom-AR profile was dominated
+  by NCCL/PYNCCL imbalance on one TP rank.
+- Nsight Systems GPU metrics cannot provide whole-run V100 resource sampling
+  on this host: `--gpu-metrics-devices=help` reports all V100 devices as
+  unsupported architecture. Whole-run resource estimates therefore need the
+  safer two-step method: Nsys for kernel time buckets plus NCU for selected
+  representative kernels.
+  - Rechecked with sudo on the active `/usr/local/cuda/bin/nsys` 2024.6.2
+    binary after operator feedback. The result is the same for V100:
+    `Tesla PG503-216 ... Unsupported architecture`; only the RTX 4060 Ti is
+    listed as a supported GPU metrics device. Earlier project Nsys captures
+    used CUDA/NVTX timeline collection, not V100 `--gpu-metrics-*` sampling.
+- A custom-all-reduce eager/fallback smoke passed on the same short shape, but
+  the corresponding Nsys timeline is also not resource evidence: under Nsys,
+  one rank spent `1231.894 ms` in `vllm::cross_device_reduce_1stage`, so the
+  kernel-time percentages are dominated by an all-reduce wait/spin kernel.
+- Nsight Compute SpeedOfLight was collected for the real Qwen3.6-35B-A3B-AWQ
+  layer-1 AWQ MoE exactness harness, capturing the first two TurboMind
+  `gemm_kernel` launches on a V100. Stage labels are inferred from call order:
+  W13 fused SiLU/mul first, W2 fused weighted-reduce second.
+  - W13 fused SiLU/mul: `34.016 us`, SM throughput `29.73% avg`
+    (`34.13% max`), DRAM throughput `23.31% avg`, compute-memory throughput
+    `52.06% avg`, L1TEX throughput `59.34% avg`, L2 throughput `11.61% avg`,
+    tensor-pipe active `8.39% avg`.
+  - W2 fused weighted-reduce: `29.184 us`, SM throughput `21.45% avg`
+    (`24.46% max`), DRAM throughput `13.58% avg`, compute-memory throughput
+    `34.32% avg`, L1TEX throughput `41.33% avg`, L2 throughput `7.76% avg`,
+    tensor-pipe active `4.72% avg`.
+  - Interpretation: the TurboMind AWQ MoE decode GEMMs are not DRAM-bandwidth
+    saturated in the single-token/top-k shape. The remaining headroom is mostly
+    from low small-GEMM occupancy/parallelism and launch granularity, not from
+    the removed standalone weighted-reduce kernel.
+- Nsight Compute SpeedOfLight was also collected for the full-model F16 dense
+  `gemv2T_kernel_val` kernel by profiling only the benchmark
+  `cudaProfilerStart/Stop` region (`--profile-from-start off`).
+  - Two matched `grid=768x1x1` launches measured `44.512 us` and `43.744 us`.
+  - SM throughput was `36.42%` and `37.39%` avg; DRAM throughput was `49.98%`
+    and `50.80%` avg; L1TEX throughput was `52.73%` and `52.04%` avg; L2
+    throughput was `25.88%` and `26.37%` avg.
+  - Tensor-pipe active was `0.0%` for these kernels because the cuBLAS path is
+    GEMV, not tensor-core GEMM.
+  - Interpretation: the main F16 dense GEMV bucket still has optimization
+    room. It is partially bandwidth-limited but not near peak DRAM; it is also
+    not using tensor cores, so improvements should focus on batching/fusing
+    GEMV work, replacing GEMV with grouped/batched GEMM where shape permits, or
+    reducing launch count rather than expecting a single cuBLAS GEMV to reach
+    dense GEMM utilization.
+- A standalone micro F16 CUTLASS GEMM for `M=1,K=2048,N=49152` measured DRAM
+  throughput `81.84%` and SM throughput `24.84%`. This is useful as a contrast:
+  some F16 dense shapes are already bandwidth-heavy, but the actual full-model
+  `gemv2T` decode kernels above are only around half of peak DRAM.
+- F16 dense allowlist route-hit experiments on the same short
+  35B-AWQ TP2 eager/fallback/custom-AR smoke:
+  - Baseline with no F16 dense fast path:
+    `steady_decode_tps=8.3039`, `tpot=0.120425 s`.
+  - `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` plus
+    `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj` prepared and used
+    `language_model.model.layers.*.linear_attn.out_proj` (`2048x2048`) and
+    improved the short smoke to `steady_decode_tps=8.5354`,
+    `tpot=0.117159 s` (`~2.8%` vs baseline).
+  - Expanding the allowlist to `in_proj_qkvz,in_proj_ba,out_proj` was a
+    regression on the same short smoke: `steady_decode_tps=8.1371`,
+    `tpot=0.122894 s`. Do not default the GDN input projections to the current
+    SM70 F16 dense path without a different implementation or longer accepted
+    evidence.
+- Nsys timeline for the `out_proj`-only F16 dense fast path:
+  - The first attempt ended during checkpoint loading before producing a
+    decode JSON or `.nsys-rep`; it is discarded as invalid evidence.
+  - Retry1 completed with
+    `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1`,
+    `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj`, custom all-reduce enabled,
+    `input_len=32`, `output_len=8`, `warmup=1`, `repeat=1`, eager/fallback.
+    Under Nsys overhead it measured `tpot=0.147911 s` and
+    `steady_decode_tps=6.7608`; this is only a timeline sample, not a speed
+    baseline.
+  - The timeline confirms the route is real: per V100, CUBLAS/CUTLASS dense
+    launches dropped from `3360` to `3120`, and `240` TurboMind F16 dense
+    launches appeared (`Operand_B_Pack<__half>`). AWQ MoE TurboMind launches
+    stayed at `624` per V100 and no standalone AWQ weighted-reduce kernel
+    appeared.
+  - Using the same classifier and excluding only the custom all-reduce
+    wait/spin kernel from active kernel time, CUBLAS/CUTLASS dense went from
+    `25.692/25.609 ms` per V100 to `22.185/22.067 ms`; the new TurboMind F16
+    dense bucket was `4.651/4.659 ms` per V100, or about `4.7/5.0%` of active
+    kernel time. This explains the small positive smoke result: `out_proj`
+    helps, but its current coverage is too narrow to deliver a large decode
+    uplift alone.
+- NCU SpeedOfLight for the real 35B-AWQ `linear_attn.out_proj` TurboMind F16
+  decode kernel (`layer0`, weight `[2048,4096]`, input `[1,4096]`) measured:
+  - Duration `31.648 us`, grid `(16,1,4)`, block `(128,1,1)`, `0.44`
+    waves/SM.
+  - SM throughput `8.35% avg` (`9.86% max`), DRAM throughput `46.94% avg`
+    (`47.19% max`), compute-memory throughput `46.94% avg`, L1TEX throughput
+    `50.11% avg`, L2 throughput `21.46% avg`, tensor-pipe active
+    `4.62% avg`.
+  - Interpretation: this fast path is a narrow memory-oriented improvement for
+    one projection, not a high-utilization tensor-core regime. The larger
+    optimization target remains regrouping/fusing more decode work so that the
+    model exposes larger effective M or fewer launches.
+- Source policy decision after accepted-shape A/B: do not default any
+  Qwen3.5 MoE projection to the F16 dense path. `out_proj` remains available
+  only through the explicit experimental
+  `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj` gate.
+  - The earlier short eager/fallback smoke with `out_proj` showed a local
+    operator-level gain (`steady_decode_tps=8.5354` vs `8.3039`, about
+    `+2.8%`), but that was not accepted 35B speed evidence.
+  - Same-card 35B-AWQ TP2 formal decode lane, `input_len=4096`,
+    `output_len=1024`, `--ignore-eos`, no-compile FULL decode graph, custom
+    all-reduce, GPU 2/3:
+    - no F16 dense:
+      `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_no_f16dense.json`,
+      `steady_decode_tps_mean=74.1842`, `tpot_seconds_mean=0.013480`.
+    - F16 `out_proj`:
+      `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_f16outproj_gpu23_rerun.json`,
+      `steady_decode_tps_mean=73.0648`, `tpot_seconds_mean=0.013686`.
+    - Delta: F16 `out_proj` is `-1.51%` on the same GPU pair for the formal
+      4K/1K graph lane. The default allowlist was reverted; keep this route
+      explicit unless a new implementation changes the long-run result.
+- F16 dense split follow-up:
+  - `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj,in_proj_qkvz` passed a short
+    35B-AWQ TP2 eager/fallback/custom-AR smoke with `input_len=32`,
+    `output_len=8`, `warmup=1`, `repeat=1`.
+  - Result: `steady_decode_tps=8.3369`, `tpot=0.119949 s`. This is slightly
+    above the no-F16 eager smoke but below `out_proj`-only, so `in_proj_qkvz`
+    must not be added to the default allowlist.
+  - `out_proj,in_proj_ba` did not produce valid speed evidence: one attempt
+    failed startup due low free memory in the local CUDA view, and a retry
+    terminated during checkpoint loading.
+- Graph route recovery:
+  - The old 0.0.3 compile graph route
+    (`VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`,
+    `mode=VLLM_COMPILE`, `cudagraph_mode=FULL_AND_PIECEWISE`) still fails on
+    the 35B-AWQ TP2 short run during the first PIECEWISE CUDA graph capture.
+    The custom-all-reduce variant logged `Registering 0 cuda graph addresses`
+    before worker exit; a no-custom-all-reduce rerun reproduced the same
+    worker termination after Dynamo bytecode transform. This rules out custom
+    all-reduce as the primary blocker.
+  - Explicit no-compile decode graph recovered the large lost speed component:
+    `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=0`,
+    `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1`,
+    `mode=NONE`, `cudagraph_mode=FULL_DECODE_ONLY`, capture size `1`, custom
+    all-reduce enabled. The `input_len=128`, `output_len=32`, `warmup=1`,
+    `repeat=3` short sample completed graph capture in about `1 s`, registered
+    `80` custom-all-reduce graph addresses per rank, and measured
+    `steady_decode_tps_mean=87.5845`, `tpot_mean=0.011418 s`.
+  - Source policy update: SM70 Flash-V100 now honors the default
+    `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1` when deciding whether to
+    auto-set `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`. The quality/speed
+    and release matrix helpers now default to no-compile decode graph as well.
+    The compile graph route remains available by explicitly setting
+    `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=0` and
+    `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`.
+  - Verification without either graph env explicitly set:
+    35B-AWQ TP2 `input_len=128`, `output_len=16`, `warmup=1`, `repeat=2`
+    logged `Using SM70 Flash-V100 no-compile decode CUDA graph policy:
+    mode=NONE, cudagraph_mode=FULL_DECODE_ONLY, capture_size=1`, completed
+    FULL decode graph capture, and measured `steady_decode_tps_mean=86.6214`,
+    `tpot_mean=0.011545 s`.
+  - A 35B-AWQ TP2 4K/1K speed run without `ignore_eos` is not accepted
+    because one measured repeat naturally stopped at token `66`. Its pure
+    decode TPS (`72.51` for the full-length repeat and `73.62` for the short
+    repeat) was useful as route evidence only.
+  - Accepted 4K/1K speed baseline for this lane:
+    Qwen3.6-35B-A3B-AWQ, TP2, GPUs `0,1`, `input_len=4096`,
+    `output_len=1024`, `ignore_eos=true`, `warmup=1`, `repeat=2`,
+    `max_model_len=262144`, `max_num_batched_tokens=8096`,
+    `max_num_seqs=1`, `gpu_memory_utilization=0.88`, custom all-reduce on,
+    Flash-V100 attention, no MTP, default no-compile decode CUDA graph,
+    and `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` with the default MoE
+    `out_proj` allowlist.
+    - Route logs: `mode=NONE`, `cudagraph_mode=FULL_DECODE_ONLY`,
+      capture size `1`; FULL decode graph capture completed in about `1 s`;
+      custom all-reduce registered `80` CUDA graph addresses per rank;
+      `SM70 AWQ MoE TurboMind batched path enabled`; legacy single-token
+      compact path enabled; Flash-V100 backend selected; fused LM-head top1
+      path enabled during inference.
+    - Capacity: GPU KV cache size `1,433,469` tokens; maximum concurrency
+      `5.47x` for `262,144` tokens per request.
+    - Both measured repeats produced `1024` tokens with `finish_reason=length`.
+      Pure steady decode TPS values were `72.5456` and `72.5576`;
+      mean `72.5516 tok/s`. Mean TPOT was `13.7833 ms`; mean prefill time was
+      `0.7997 s`; mean end-to-end output throughput was `68.7105 tok/s`.
+  - Interpretation: the no-compile FULL_DECODE_ONLY lane restores the missing
+    graph-replay speed and gives a valid 4K/1K baseline, but it is still below
+    the earlier 35B-AWQ TP2 long-context Flash-V100 pure decode evidence
+    (`84.5963 tok/s` on `input_len=16324`, `output_len=256`) and below the
+    project target implied by old 0.0.3 compile-graph 4K/1K artifacts. The
+    next optimization step should profile this accepted 4K/1K lane with Nsys
+    timeline plus targeted NCU kernels to locate the remaining gap.
+- Relevant artifacts:
+  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_turbomind_weighted_reduce_i32_o4_eager_fallback_gmem070_nocar.json`
+  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_nocar_i32_o8.nsys-rep`
+  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_nocar_i32_o8_kernel_summary.json`
+  - `bench_results/sm70_migration_20260621/ncu_awq_moe_legacy_weighted_reduce_35a3b_layer1_random_unique1_turbomind_w13_w2_sol_gpu0_summary.json`
+  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_customar_i32_o8_kernel_summary.json`
+  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_customar_i32_o8_kernel_summary_v2.json`
+  - `bench_results/sm70_migration_20260621/ncu_dense_gemv2t_35a3b_awq_tp2_i32_o4_profile_startstop_sol_summary.json`
+  - `bench_results/sm70_migration_20260621/ncu_micro_dense_cutlass_fp16_m1_k2048_n49152_sol_summary.json`
+  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_outproj_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
+  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_gdn_inout_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
+  - `bench_results/sm70_migration_20260621/decode_nsys_35a3b_awq_tp2_f16_outproj_fastpath_i32_o8_eager_fallback_gmem070_customar_retry1.json`
+  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_f16_outproj_fastpath_eager_fallback_customar_i32_o8_retry1.nsys-rep`
+  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_f16_outproj_fastpath_eager_fallback_customar_i32_o8_retry1_kernel_summary.json`
+  - `bench_results/sm70_migration_20260621/ncu_f16_outproj_sm70_qwen36_35a3b_layer0_m1_sol_summary.json`
+  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_outproj_defaultallow_i32_o4_eager_fallback_gmem070_customar.json`
+  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_out_qkvz_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
+  - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o32_gmem070_nocar_retry1.log`
+  - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o32_nocompile_full_decode_gmem070_customar.json`
+  - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o16_default_nocompile_route_gmem070_customar.json`
+  - `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_nocompile_fulldecode_gmem088_customar_f16outproj.json`
+  - `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_f16outproj.json`
+
+## 2026-06-21 DDTree 27B-AWQ Bring-Up Status
+
+- Per operator direction, DDTree work is now evaluated against the normal
+  no-spec baseline only. Do not spend more cycles on flat DFlash-only speed
+  tests unless explicitly requested; flat fallback numbers are not DDTree
+  acceleration evidence.
+- Implemented the first graph-safe DDTree verifier stack for
+  Qwen3.6-27B-AWQ:
+  - fused DDTree GDN verifier state path in causal conv and sigmoid-gating
+    delta-rule update;
+  - Flash-V100 paged-KV Triton ancestor-mask branch attention in
+    `vllm/v1/attention/backends/ddtree_branch_triton.py`;
+  - Flash-V100 DDTree route now prefers `prefill_ddtree_triton` and keeps the
+    old dense mask as an eager correctness fallback only;
+  - DDTree env switches are registered in `envs.py`.
+- Correctness checks:
+  - Python compile passed for `envs.py`, `flash_attn_v100.py`, and
+    `ddtree_branch_triton.py`.
+  - Synthetic CUDA attention checks matched the dense DDTree visibility mask
+    exactly, including padded parent slots and sliding-window masking.
+  - Real 27B-AWQ DDTree runs matched the no-spec hash
+    `d7e8a039cc9363c9d968bb2b1c0deea9cf6a53fecca39a7fdfdc853a869eaf7f`.
+- Valid speed evidence on `input_len=32`, `output_len=16`, TP2, AWQ,
+  Flash-V100, `mamba_cache_mode=align`, spec tokens `16`:
+  - Normal no-spec graph baseline:
+    `bench_results/ddtree_smoke_20260621/27b_awq_nospec_flashv100_graph_i32_o16_w2r3.json`,
+    mean steady decode `48.6173 tok/s`.
+  - Old DDTree tree verify with dense attention fallback:
+    `27b_awq_dflash_ddtree32_topk4_nochain_flashv100_i32_o16.json`,
+    eager, mean steady decode `4.8949 tok/s`.
+  - Fused GDN plus dense attention fallback:
+    `27b_awq_dflash_ddtree32_topk4_nochain_fusedgdn_tree_eager_i32_o16.json`,
+    eager, mean steady decode `8.8475 tok/s`.
+  - Fused GDN plus Triton branch attention:
+    `27b_awq_dflash_ddtree32_topk4_nochain_tritonattn_fusedgdn_tree_eager_i32_o16.json`,
+    eager, route `prefill_ddtree_triton=160`, mean steady decode
+    `11.4074 tok/s`.
+  - Fused GDN plus Triton branch attention with no-compile FULL_DECODE_ONLY
+    graph:
+    `27b_awq_dflash_ddtree32_topk4_nochain_tritonattn_fusedgdn_tree_graph_i32_o16_w2r3.json`,
+    capture size `33`, route `prefill_ddtree_triton=400`, mean steady decode
+    `12.0542 tok/s`.
+- Invalid or non-best DDTree evidence:
+  - Runs without `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE=1` can silently
+    reject branched payloads and schedule flat speculative rows. Treat those as
+    invalid DDTree tree-verify speed numbers.
+  - AEON-style `ddtree_budget=22`, `top_k=8`, `chain_seed=true`, adapted to
+    spec tokens `16`, completed but was slower: `9.5538 tok/s`, acceptance
+    length `2.8333`, `num_drafts=6`.
+  - `ddtree_budget=32`, `top_k=8`, `chain_seed=true` exited during engine
+    startup with process status `139`; no route or sampler metrics were
+    produced, so it is not evidence.
+- Interpretation:
+  - The DDTree verifier kernel and CUDA graph path are now functional, but
+    DDTree is still far below the normal no-spec graph baseline.
+  - Current best DDTree accepts only `11` target tokens across `5` drafts for
+    16 output tokens (`acceptance_length=3.2`, `draft_tokens_per_step=32`).
+    This acceptance/proposal quality is the main speed limiter now.
+  - `build_ddtree_payloads_from_logits()` still does GPU-to-CPU top-k/logprob
+    materialization and Python heap tree construction on the hot path. Profile
+    and replace that before claiming recovered DDTree speed.
+- Next DDTree work:
+  - Add per-step DDTree timing for tree build, drafter forward, target verify,
+    sampler, and state/KV commit.
+  - Move the DDTree payload builder off the synchronized Python CPU path or
+    prove its cost is negligible on long-output runs.
+  - Continue only DDTree tree-verify parameter sweeps motivated by the
+    reference plan (`budget=32/40/48`, `top_k=4/8`, chain seed on/off), with
+    hash parity and `prefill_ddtree_triton` route required.
+
+### DDTree acceptance debug update
+
+- Added debug-only DDTree verifier logging that reports whether each target
+  argmax is present in the tree and in the DFlash per-depth top-k candidates.
+- Added default-on DDTree DFlash drafter-context compaction:
+  `VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT=1`. Accepted non-flat tree rows
+  are copied back into the flat committed hidden/input stream before the next
+  DFlash proposal. A direct unit-style test now covers this branch copy.
+- The first post-fix debug smoke,
+  `27b_awq_dflash_ddtree32_topk4_nochain_compactctx_debug_graph_i32_o16`,
+  still had low acceptance (`acceptance_length=3.0`). The debug walk showed the
+  main failure mode is candidate coverage: target argmax tokens often fall
+  outside `top_k=4`, or are in per-depth top-k but absent under the budgeted
+  parent. This shifts the next experiment to reference-shaped tree coverage,
+  not sampler rewrites.
+- Default `ddtree_top_k` is now `8`, matching AEON's deployable Qwen3.6 DDTree
+  profile. Official DDTree uses `topk=min(budget,vocab)`, so a `top_k=16/32`
+  check is still needed when GPUs are free.
+- Attempts to run `top_k=8` and `top_k=32` after the debug smoke failed only
+  because a separate TP4 API server occupied all V100 memory. These startup
+  failures are not DDTree correctness or performance evidence.
+
+## 2026-06-21 TileRT-Style 27B-AWQ MLP Down-Proj Experiment
+
+- Implemented a default-off TurboMind-only TP2 experiment for the dense MLP
+  `down_proj` boundary:
+  - GEMM epilogue publishes tile-ready flags for complete output N tiles.
+  - Custom all-reduce rank-data/IPC registration is reused by the AWQ GEMM op.
+  - `RowParallelLinear.down_proj` can dispatch a single graph-capturable custom
+    op under `VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP=1`.
+  - Supported scope is M=1 decode, TP2, fp16 output, Qwen3.6-27B-AWQ dense MLP.
+- Correctness state:
+  - Same-stream wait-reduce and epilogue-fused reduce both reached exact token
+    hash parity after fixing logical tile publication and per-tile epoch
+    advancement.
+  - Stable 32-token comparison hash for both baseline and fused path:
+    `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
+- Performance state:
+  - Accepted comparison shape: Qwen3.6-27B-AWQ, TP2, GPU0/1,
+    `input_len=512`, `output_len=32`, `warmup=1`, `repeat=2`, Flash-V100
+    compile graph, AWQ TurboMind dense path enabled.
+  - Baseline normal custom all-reduce:
+    `17.7176 ms` mean TPOT, `56.4411 tok/s` steady decode.
+  - Epilogue-fused tile reduce:
+    `18.0920 ms` mean TPOT, `55.2730 tok/s` steady decode.
+  - Result: fused epilogue reduce is about `2.1%` slower and must not be
+    promoted.
+  - Tail-worker reduce, same-day current-binary A/B; the benchmark command
+    recorded `VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS=1`:
+    - baseline normal custom all-reduce:
+      `17.5106 ms` mean TPOT, `57.1084 tok/s` steady decode;
+    - tail-worker reduce:
+      `17.9204 ms` mean TPOT, `55.8023 tok/s` steady decode;
+    - stable token hash matched baseline:
+      `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
+    - Result: tail-worker improves the earlier per-tile fused variant but is
+      still about `2.34%` slower than the current normal path.
+- Interpretation:
+  - This is a useful negative result. Waiting for peer tiles inside the
+    Tensor Core GEMM CTA makes the GEMM critical path longer. The next
+    TileRT-style route must use a lightweight tile scheduler/worker that does
+    not block producer CTAs and does not serialize the final row reduce into a
+    single tail CTA.
+  - The earlier side-stream reducer-worker prototype hung in actual decode,
+    so it should be redesigned rather than scaled by more reducer CTAs.
+  - A post-benchmark attempt to turn `reducer_blocks == 1` into an explicit
+    tail-worker switch caused graph-capture startup failure
+    (`Registering 0 cuda graph addresses`, then worker exit) and was reverted.
+- Artifacts:
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/baseline_i512_o32_r2.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/fused_localfrag_i512_o32_r2.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/baseline_current_i512_o32_r2.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_i512_o32_r2.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_i512_o4.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/epilogue_fused_epochfix_i512_o4.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/samestream_publishfix_i512_o4.json`
+
+### Single-kernel reducer CTA follow-up
+
+- Implemented a narrower default-off single-kernel prototype:
+  - Env gate:
+    `VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS`, default `0`.
+  - TurboMind producer CTAs store rank-local staging output and publish
+    tile-ready flags without waiting.
+  - A second z-plane of reducer CTAs is appended to the same `gemm_kernel`
+    launch. Active reducer CTAs wait for both TP2 ranks' tile flags and write
+    final `half2` sums.
+  - Scope remains M=1 decode, TP2, fp16 output, dense 27B-AWQ MLP
+    `down_proj`.
+- Build and correctness:
+  - Direct `_C` build succeeded with
+    `cmake --build build/temp.linux-x86_64-cpython-312 --target _C -j 8`.
+    Full `setup.py build_ext --inplace` still trips the unrelated
+    `_deep_gemm_C` target in this worktree.
+  - Import/schema check passed with the new op argument.
+  - Short smoke hash matched the previous short route:
+    `e3b3ebc930b09ed8921c4e20f0c8dd6fb93f0bd51c382cdc33a485050ef60939`.
+  - Stable 32-token hash matched the normal-path steady hash:
+    `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
+- Performance under the same compile/fallback setup on GPU0/1,
+  Qwen3.6-27B-AWQ TP2, `input_len=512`, `output_len=32`, `warmup=1`,
+  `repeat=2`:
+  - tail-worker control:
+    `17.8614 ms` mean TPOT, `55.9866 tok/s` steady decode;
+  - `kernel_reducer_blocks=1`:
+    `23.7277 ms` mean TPOT, `42.1449 tok/s` steady decode;
+  - `kernel_reducer_blocks=4`:
+    `19.5130 ms` mean TPOT, `51.2478 tok/s` steady decode;
+  - result: the appended reducer CTA path is about `9.25%` slower than the
+    same-run tail-worker control with four active reducers; one active reducer
+    is about `32.84%` slower and clearly serializes the reduce tail.
+- Decision:
+  - Do not scale this by adding reducer CTAs. The negative result shows that
+    "one kernel" without real tile scheduling is not enough: the appended
+    reducer CTAs contend with GEMM CTAs and can delay Tensor Core work.
+  - The next TileRT-style implementation must move to a persistent/flattened
+    scheduler shape with explicit CTA roles or a device-side tile queue. The
+    scheduler must keep compute CTAs dominant and let reduce/communication CTAs
+    consume ready tiles only when doing so does not starve the producer GEMM.
+- Additional artifacts:
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o4.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer1_compile_fallback_i512_o32_r2.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o32_r2.json`
+  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_compile_fallback_i512_o32_r2.json`

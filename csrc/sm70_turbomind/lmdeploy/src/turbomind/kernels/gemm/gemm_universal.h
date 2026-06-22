@@ -168,11 +168,81 @@ struct GemmUniversal {
 
 extern __shared__ char smem_buf[];
 
+__device__ __forceinline__ bool TryRunTileAllReduceReducerCta(const EpilogueParam& epi_param)
+{
+    if (!epi_param.tile_allreduce) {
+        return false;
+    }
+
+    const auto& tile_ar = epi_param.tile_allreduce_param;
+    if (tile_ar.kernel_reducer_blocks <= 0) {
+        return false;
+    }
+    if ((int)blockIdx.z != tile_ar.producer_grid_z) {
+        return false;
+    }
+
+    if (tile_ar.world_size != 2 || tile_ar.rank_data == nullptr || tile_ar.output == nullptr ||
+        tile_ar.self_signal == nullptr || tile_ar.tile_numel <= 0 || tile_ar.output_numel <= 0 ||
+        (tile_ar.tile_numel & 1) || (tile_ar.output_numel & 1) || tile_ar.producer_grid_x <= 0 ||
+        tile_ar.producer_grid_y <= 0) {
+        return true;
+    }
+
+    const int reducer_id = (int)blockIdx.y * tile_ar.producer_grid_x + (int)blockIdx.x;
+    if (reducer_id >= tile_ar.kernel_reducer_blocks) {
+        return true;
+    }
+
+    const int tile_count = (tile_ar.output_numel + tile_ar.tile_numel - 1) / tile_ar.tile_numel;
+    if (tile_count <= 0 || tile_count > vllm::sm70_tile_runtime::kMaxBlocks) {
+        return true;
+    }
+
+    const int tid = threadIdx.x;
+    auto* self_signal = reinterpret_cast<vllm::sm70_tile_runtime::Signal*>(tile_ar.self_signal);
+    const auto rank_data =
+        *reinterpret_cast<const vllm::sm70_tile_runtime::RankData*>(tile_ar.rank_data);
+    const auto* rank0 = reinterpret_cast<const half2*>(rank_data.ptrs[0]);
+    const auto* rank1 = reinterpret_cast<const half2*>(rank_data.ptrs[1]);
+    auto* output      = reinterpret_cast<half2*>(tile_ar.output);
+
+    for (int tile_id = reducer_id; tile_id < tile_count; tile_id += tile_ar.kernel_reducer_blocks) {
+        const int elem_begin = tile_id * tile_ar.tile_numel;
+        const int elem_end   = min(elem_begin + tile_ar.tile_numel, tile_ar.output_numel);
+        const int h2_begin   = elem_begin / 2;
+        const int h2_end     = elem_end / 2;
+        const auto flag      = self_signal->_flag[tile_id] + 1;
+
+        if (tid < tile_ar.world_size) {
+            auto* self_flag = &self_signal->start[tile_id][tid];
+            while (vllm::sm70_tile_runtime::load_flag_sys_visible(self_flag) != flag) {
+            }
+        }
+
+        __syncthreads();
+
+        for (int idx = h2_begin + tid; idx < h2_end; idx += blockDim.x) {
+            output[idx] = __hadd2(rank0[idx], rank1[idx]);
+        }
+
+        __syncthreads();
+        if (tid == 0) {
+            self_signal->_flag[tile_id] = flag;
+        }
+    }
+
+    return true;
+}
+
 template<class Kernel, class Param, class EpilogueParam, class Scheduler>
 __global__ void gemm_kernel(Param param, EpilogueParam epi_param, Scheduler sched)
 {
 #if __CUDA_ARCH__
     if constexpr (Kernel::Arch::is_compatible(__CUDA_ARCH__)) {
+        if (TryRunTileAllReduceReducerCta(epi_param)) {
+            return;
+        }
         Kernel kernel;
         kernel(param, epi_param, sched, smem_buf);
     }

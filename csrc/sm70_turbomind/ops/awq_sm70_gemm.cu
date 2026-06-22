@@ -36,6 +36,7 @@
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
+#include "custom_all_reduce.cuh"
 
 namespace turbomind {
 void unpack_awq_gemm(uint4_t* dst, const uint4_t* src, int rows, int cols, cudaStream_t st);
@@ -2236,7 +2237,8 @@ void awq_gemm_sm70_out(torch::Tensor out,
                        int64_t group_size,
                        int64_t k_ld,
                        int64_t q_ld,
-                       bool gated_silu) {
+                       bool gated_silu,
+                       const turbomind::gemm::TileAllReduceParam* tile_reduce) {
   TORCH_CHECK(in_feats.is_cuda(), "awq_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "awq_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "awq_gemm_sm70: scales must be CUDA.");
@@ -2364,6 +2366,15 @@ void awq_gemm_sm70_out(torch::Tensor out,
       static_cast<int>(group_size), stream);
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
+  if (tile_reduce != nullptr) {
+    TORCH_CHECK(!gated_silu,
+                "awq_gemm_sm70: tile all-reduce cannot combine gated_silu.");
+    op.epilogue = static_cast<turbomind::gemm::Epilogue>(
+        static_cast<int>(op.epilogue) |
+        static_cast<int>(turbomind::gemm::Epilogue::kTileAllReduce));
+    op.tile_allreduce = const_cast<turbomind::gemm::TileAllReduceParam*>(
+        tile_reduce);
+  }
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
@@ -2389,6 +2400,106 @@ void awq_gemm_sm70_out(torch::Tensor out,
                           workspace_holder.workspace,
                           stream);
   TORCH_CHECK(ec == 0, "awq_gemm_sm70: TurboMind GEMM failed.");
+}
+
+void awq_gemm_sm70_out(torch::Tensor out,
+                       torch::Tensor in_feats,
+                       torch::Tensor tm_weight,
+                       torch::Tensor tm_scales,
+                       int64_t group_size,
+                       int64_t k_ld,
+                       int64_t q_ld,
+                       bool gated_silu) {
+  awq_gemm_sm70_out(out, in_feats, tm_weight, tm_scales, group_size, k_ld,
+                    q_ld, gated_silu, nullptr);
+}
+
+void awq_gemm_sm70_out_tile_reduce(torch::Tensor out,
+                                   torch::Tensor staging,
+                                   torch::Tensor in_feats,
+                                   torch::Tensor tm_weight,
+                                   torch::Tensor tm_scales,
+                                   int64_t group_size,
+                                   int64_t k_ld,
+                                   int64_t q_ld,
+                                   int64_t fa_ptr,
+                                   int64_t tile_numel,
+                                   int64_t reducer_blocks,
+                                   int64_t kernel_reducer_blocks,
+                                   bool overlap) {
+  TORCH_CHECK(out.is_cuda() && staging.is_cuda() && in_feats.is_cuda(),
+              "awq_gemm_sm70_tile_reduce: tensors must be CUDA.");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  staging.scalar_type() == torch::kFloat16 &&
+                  in_feats.scalar_type() == torch::kFloat16,
+              "awq_gemm_sm70_tile_reduce: out/staging/input must be fp16.");
+  TORCH_CHECK(out.sizes() == staging.sizes(),
+              "awq_gemm_sm70_tile_reduce: out and staging shape mismatch.");
+  TORCH_CHECK(out.dim() == 2 && staging.dim() == 2 &&
+                  out.size(0) == 1 && staging.size(0) == 1,
+              "awq_gemm_sm70_tile_reduce: only M=1 is supported.");
+  TORCH_CHECK(out.stride(1) == 1 && staging.stride(1) == 1,
+              "awq_gemm_sm70_tile_reduce: outputs must be row-major.");
+  TORCH_CHECK(fa_ptr != 0,
+              "awq_gemm_sm70_tile_reduce: custom all-reduce handle is null.");
+  TORCH_CHECK(tile_numel > 0 && reducer_blocks >= 0 &&
+                  kernel_reducer_blocks >= 0,
+              "awq_gemm_sm70_tile_reduce: invalid tile runtime config.");
+  if (kernel_reducer_blocks > 0) {
+    TORCH_CHECK(overlap,
+                "awq_gemm_sm70_tile_reduce: kernel reducer requires overlap.");
+    TORCH_CHECK((tile_numel & 1) == 0 && (staging.numel() & 1) == 0,
+                "awq_gemm_sm70_tile_reduce: kernel reducer requires half2 "
+                "aligned tile/output sizes.");
+  }
+
+  auto* fa = reinterpret_cast<::vllm::CustomAllreduce*>(fa_ptr);
+  TORCH_CHECK(fa->world_size_ == 2,
+              "awq_gemm_sm70_tile_reduce: only TP2 is supported.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_feats));
+  const int device = in_feats.get_device();
+  auto current_stream = at::cuda::getCurrentCUDAStream(device);
+  cudaStreamCaptureStatus capture_status;
+  AT_CUDA_CHECK(cudaStreamIsCapturing(current_stream.stream(),
+                                      &capture_status));
+  TORCH_CHECK(capture_status == cudaStreamCaptureStatusActive,
+              "awq_gemm_sm70_tile_reduce requires CUDA graph capture.");
+
+  turbomind::gemm::TileAllReduceParam tile_reduce{};
+  for (int i = 0; i < fa->world_size_; ++i) {
+    tile_reduce.signals[i] = fa->sg_.signals[i];
+  }
+  tile_reduce.self_signal = fa->self_sg_;
+  tile_reduce.rank_data = nullptr;
+  tile_reduce.output = nullptr;
+  tile_reduce.rank = fa->rank_;
+  tile_reduce.world_size = fa->world_size_;
+  tile_reduce.tile_numel = static_cast<int>(tile_numel);
+  tile_reduce.output_numel = static_cast<int>(staging.numel());
+  tile_reduce.reducer_blocks = static_cast<int>(reducer_blocks);
+  tile_reduce.kernel_reducer_blocks =
+      overlap ? static_cast<int>(kernel_reducer_blocks) : 0;
+
+  if (overlap) {
+    tile_reduce.rank_data = fa->rank_data_for_buffer(
+        current_stream.stream(), staging.data_ptr(),
+        "awq_gemm_sm70_tile_reduce");
+    tile_reduce.output = out.data_ptr();
+    awq_gemm_sm70_out(staging, in_feats, tm_weight, tm_scales, group_size,
+                      k_ld, q_ld, false, &tile_reduce);
+    return;
+  }
+
+  if (!overlap) {
+    awq_gemm_sm70_out(staging, in_feats, tm_weight, tm_scales, group_size,
+                      k_ld, q_ld, false, &tile_reduce);
+    fa->tile_runtime_wait_reduce<half>(
+        current_stream.stream(), reinterpret_cast<half*>(staging.data_ptr()),
+        reinterpret_cast<half*>(out.data_ptr()), out.numel(), tile_numel,
+        reducer_blocks);
+    return;
+  }
 }
 
 void fp8_gemm_sm70_out(torch::Tensor out,
@@ -3441,6 +3552,25 @@ void awq_gemm_sm70_out(torch::Tensor out,
                                     gated_silu);
 }
 
+void awq_gemm_sm70_out_tile_reduce(torch::Tensor out,
+                                   torch::Tensor staging,
+                                   torch::Tensor _in_feats,
+                                   torch::Tensor _kernel,
+                                   torch::Tensor _scaling_factors,
+                                   int64_t group_size,
+                                   int64_t k_ld,
+                                   int64_t q_ld,
+                                   int64_t fa_ptr,
+                                   int64_t tile_numel,
+                                   int64_t reducer_blocks,
+                                   int64_t kernel_reducer_blocks,
+                                   bool overlap) {
+  vllm::awq_sm70::awq_gemm_sm70_out_tile_reduce(
+      out, staging, _in_feats, _kernel, _scaling_factors, group_size, k_ld,
+      q_ld, fa_ptr, tile_numel, reducer_blocks, kernel_reducer_blocks,
+      overlap);
+}
+
 void fp8_gemm_sm70_out(torch::Tensor out,
                        torch::Tensor _in_feats,
                        torch::Tensor _kernel,
@@ -4000,6 +4130,23 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
     int64_t n,
     int64_t group_size,
     bool gated_silu);
+
+void awq_moe_gemm_sm70_out_impl(
+    torch::Tensor out,
+    torch::Tensor sorted_input,
+    torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w,
+    torch::Tensor strided_ptrs_s,
+    int64_t num_experts,
+    int64_t k,
+    int64_t n,
+    int64_t group_size,
+    bool gated_silu,
+    torch::Tensor b_group_indices,
+    bool per_expert_dispatch,
+    torch::Tensor reduce_out,
+    torch::Tensor sorted_weights,
+    bool weighted_reduce);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -4678,6 +4825,7 @@ void awq_moe_single_token_sm70_out(
     torch::Tensor compact_input,
     torch::Tensor intermediate,
     torch::Tensor sorted_output,
+    torch::Tensor sorted_weights,
     torch::Tensor dst_w13_ptrs_w_rows,
     torch::Tensor dst_w13_ptrs_s_rows,
     torch::Tensor dst_w2_ptrs_w_rows,
@@ -4708,6 +4856,9 @@ void awq_moe_single_token_sm70_out(
                   sorted_output.is_cuda() &&
                   sorted_output.scalar_type() == torch::kFloat16,
               "awq_moe_single_token_sm70_out: scratch buffers must be CUDA float16.");
+  TORCH_CHECK(sorted_weights.is_cuda() &&
+                  sorted_weights.scalar_type() == torch::kFloat32,
+              "awq_moe_single_token_sm70_out: sorted_weights must be CUDA float32.");
   TORCH_CHECK(expert_offsets.is_cuda() &&
                   expert_offsets.scalar_type() == torch::kInt32 &&
                   inv_permuted_idx.is_cuda() &&
@@ -4746,6 +4897,8 @@ void awq_moe_single_token_sm70_out(
                   sorted_output.size(0) == top_k &&
                   sorted_output.size(1) == w2_n,
               "awq_moe_single_token_sm70_out: sorted_output shape mismatch.");
+  TORCH_CHECK(sorted_weights.numel() >= top_k,
+              "awq_moe_single_token_sm70_out: sorted_weights size mismatch.");
   TORCH_CHECK(expert_offsets.numel() == top_k + 1,
               "awq_moe_single_token_sm70_out: expert_offsets size mismatch.");
   TORCH_CHECK(inv_permuted_idx.numel() == top_k,
@@ -4778,7 +4931,7 @@ void awq_moe_single_token_sm70_out(
     awq_moe_single_token_prepare_kernel<int32_t>
         <<<1, kThreads, 0, stream>>>(
             topk_ids.data_ptr<int32_t>(),
-            nullptr,
+            topk_weights.data_ptr<float>(),
             reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
             src_w13_ptrs_w_rows.data_ptr<uint8_t>(),
             src_w13_ptrs_s_rows.data_ptr<uint8_t>(),
@@ -4789,7 +4942,7 @@ void awq_moe_single_token_sm70_out(
             dst_w2_ptrs_w_rows.data_ptr<uint8_t>(),
             dst_w2_ptrs_s_rows.data_ptr<uint8_t>(),
             reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()),
-            nullptr,
+            sorted_weights.data_ptr<float>(),
             expert_offsets.data_ptr<int32_t>(),
             nullptr,
             inv_permuted_idx.data_ptr<int32_t>(),
@@ -4805,7 +4958,7 @@ void awq_moe_single_token_sm70_out(
     awq_moe_single_token_prepare_kernel<int64_t>
         <<<1, kThreads, 0, stream>>>(
             topk_ids.data_ptr<int64_t>(),
-            nullptr,
+            topk_weights.data_ptr<float>(),
             reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
             src_w13_ptrs_w_rows.data_ptr<uint8_t>(),
             src_w13_ptrs_s_rows.data_ptr<uint8_t>(),
@@ -4816,7 +4969,7 @@ void awq_moe_single_token_sm70_out(
             dst_w2_ptrs_w_rows.data_ptr<uint8_t>(),
             dst_w2_ptrs_s_rows.data_ptr<uint8_t>(),
             reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()),
-            nullptr,
+            sorted_weights.data_ptr<float>(),
             expert_offsets.data_ptr<int32_t>(),
             nullptr,
             inv_permuted_idx.data_ptr<int32_t>(),
@@ -4842,6 +4995,26 @@ void awq_moe_single_token_sm70_out(
       w13_n,
       group_size,
       true);
+  const bool use_weighted_reduce_epilogue = out.size(1) == w2_n;
+  if (use_weighted_reduce_epilogue) {
+    awq_moe_gemm_sm70_out_impl(
+        sorted_output,
+        intermediate,
+        expert_offsets,
+        dst_w2_ptrs_w_rows,
+        dst_w2_ptrs_s_rows,
+        top_k,
+        w2_k,
+        w2_n,
+        group_size,
+        false,
+        torch::Tensor(),
+        true,
+        out,
+        sorted_weights,
+        true);
+    return;
+  }
   awq_moe_gemm_sm70_per_expert_dispatch_out(
       sorted_output,
       intermediate,
@@ -4895,7 +5068,10 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t group_size,
     bool gated_silu,
     torch::Tensor b_group_indices = torch::Tensor(),
-    bool per_expert_dispatch = false) {
+    bool per_expert_dispatch = false,
+    torch::Tensor reduce_out = torch::Tensor(),
+    torch::Tensor sorted_weights = torch::Tensor(),
+    bool weighted_reduce = false) {
   TORCH_CHECK(sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
               "awq_moe_gemm_sm70: input must be CUDA float16.");
   TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.scalar_type() == torch::kInt32,
@@ -4904,6 +5080,14 @@ void awq_moe_gemm_sm70_out_impl(
               "awq_moe_gemm_sm70: strided_ptrs must be CUDA.");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16,
               "awq_moe_gemm_sm70: output must be CUDA float16.");
+  if (weighted_reduce) {
+    TORCH_CHECK(reduce_out.is_cuda() &&
+                    reduce_out.scalar_type() == torch::kFloat16,
+                "awq_moe_gemm_sm70: reduce_out must be CUDA float16.");
+    TORCH_CHECK(sorted_weights.is_cuda() &&
+                    sorted_weights.scalar_type() == torch::kFloat32,
+                "awq_moe_gemm_sm70: sorted_weights must be CUDA float32.");
+  }
   TORCH_CHECK(num_experts > 0 && k > 0 && n > 0,
               "awq_moe_gemm_sm70: invalid dimensions.");
   TORCH_CHECK(k % group_size == 0,
@@ -4929,7 +5113,17 @@ void awq_moe_gemm_sm70_out_impl(
               "awq_moe_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
               "awq_moe_gemm_sm70: output must be row-major contiguous.");
-  if (gated_silu) {
+  if (weighted_reduce) {
+    TORCH_CHECK(!gated_silu,
+                "awq_moe_gemm_sm70: weighted reduce cannot combine gated_silu.");
+    TORCH_CHECK(out.size(1) == n,
+                "awq_moe_gemm_sm70: output cols must match n.");
+    TORCH_CHECK(reduce_out.dim() == 2 && reduce_out.size(0) == 1 &&
+                    reduce_out.size(1) == n && reduce_out.stride(1) == 1,
+                "awq_moe_gemm_sm70: reduce_out shape mismatch.");
+    TORCH_CHECK(sorted_weights.numel() >= total_tokens,
+                "awq_moe_gemm_sm70: sorted_weights size mismatch.");
+  } else if (gated_silu) {
     TORCH_CHECK((n % 2) == 0,
                 "awq_moe_gemm_sm70: gated_silu requires even output dim.");
     TORCH_CHECK(out.size(1) == n / 2,
@@ -5038,6 +5232,18 @@ void awq_moe_gemm_sm70_out_impl(
       static_cast<int>(group_size), stream);
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
+  turbomind::gemm::MoeWeightedReduceParam moe_reduce_param{};
+  if (weighted_reduce) {
+    op.epilogue = static_cast<turbomind::gemm::Epilogue>(
+        static_cast<int>(op.epilogue) |
+        static_cast<int>(turbomind::gemm::Epilogue::kMoeWeightedReduce));
+    moe_reduce_param.out = reduce_out.data_ptr();
+    moe_reduce_param.sorted_weights = sorted_weights.data_ptr<float>();
+    moe_reduce_param.offsets = expert_offsets.data_ptr<int>();
+    op.reserved = &moe_reduce_param;
+  } else {
+    op.reserved = nullptr;
+  }
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;

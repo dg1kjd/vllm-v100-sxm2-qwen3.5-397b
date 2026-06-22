@@ -154,7 +154,7 @@ def _maybe_force_spawn():
         reasons.append("WSL is detected and NVML is not compatible with fork")
 
     if reasons:
-        logger.warning(
+        logger.debug_once(
             "We must use the `spawn` multiprocessing start method. "
             "Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
             "See https://docs.vllm.ai/en/latest/usage/"

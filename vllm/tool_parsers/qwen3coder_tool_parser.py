@@ -180,6 +180,40 @@ class Qwen3CoderToolParser(ToolParser):
         ]
         return function_calls
 
+    def _tool_start_positions(self, text: str) -> list[int]:
+        positions: list[int] = []
+        idx = 0
+        while True:
+            idx = text.find(self.tool_call_start_token, idx)
+            if idx == -1:
+                break
+            positions.append(idx)
+            idx += len(self.tool_call_start_token)
+
+        # Qwen3-Coder can emit a bare <function=...> block without the
+        # surrounding <tool_call> tag. Non-streaming already falls back to this
+        # format; keep streaming behavior consistent.
+        if not positions:
+            func_idx = text.find(self.tool_call_prefix)
+            if func_idx != -1:
+                positions.append(func_idx)
+        return positions
+
+    def _pending_tool_marker_delta_prefix(
+        self, previous_text: str, current_text: str, delta_text: str
+    ) -> str | None:
+        markers = (self.tool_call_start_token, self.tool_call_prefix)
+        for marker in markers:
+            max_len = min(len(marker) - 1, len(current_text))
+            for prefix_len in range(max_len, 0, -1):
+                if current_text.endswith(marker[:prefix_len]):
+                    pending_start = len(current_text) - prefix_len
+                    emit_len = pending_start - len(previous_text)
+                    if emit_len > 0:
+                        return delta_text[:emit_len]
+                    return ""
+        return None
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -299,20 +333,34 @@ class Qwen3CoderToolParser(ToolParser):
         # Handle normal content before tool calls
         if not self.is_tool_call_started:
             # Check if tool call is starting
+            tool_start_candidates = [
+                pos
+                for pos in (
+                    current_text.find(self.tool_call_start_token),
+                    current_text.find(self.tool_call_prefix),
+                )
+                if pos != -1
+            ]
+            tool_start = min(tool_start_candidates) if tool_start_candidates else -1
             if (
                 self.tool_call_start_token_id in delta_token_ids
-                or self.tool_call_start_token in delta_text
+                or tool_start != -1
             ):
                 self.is_tool_call_started = True
                 # Return any content before the tool call
-                if self.tool_call_start_token in delta_text:
-                    content_before = delta_text[
-                        : delta_text.index(self.tool_call_start_token)
-                    ]
+                if tool_start > len(previous_text):
+                    content_before = delta_text[: tool_start - len(previous_text)]
                     if content_before:
                         return DeltaMessage(content=content_before)
                 return None
             else:
+                pending_prefix = self._pending_tool_marker_delta_prefix(
+                    previous_text, current_text, delta_text
+                )
+                if pending_prefix is not None:
+                    if pending_prefix:
+                        return DeltaMessage(content=pending_prefix)
+                    return None
                 # Check if we're between tool calls - skip whitespace
                 if (
                     current_text.rstrip().endswith(self.tool_call_end_token)
@@ -325,26 +373,14 @@ class Qwen3CoderToolParser(ToolParser):
 
         # Check if we're between tool calls (waiting for next one)
         # Count tool calls we've seen vs processed
-        tool_starts_count = current_text.count(self.tool_call_start_token)
+        tool_start_positions = self._tool_start_positions(current_text)
+        tool_starts_count = len(tool_start_positions)
         if self.current_tool_index >= tool_starts_count:
             # We're past all tool calls, shouldn't be here
             return None
 
         # We're in a tool call, find the current tool call portion
         # Need to find the correct tool call based on current_tool_index
-        tool_start_positions: list[int] = []
-        idx = 0
-        while True:
-            idx = current_text.find(self.tool_call_start_token, idx)
-            if idx == -1:
-                break
-            tool_start_positions.append(idx)
-            idx += len(self.tool_call_start_token)
-
-        if self.current_tool_index >= len(tool_start_positions):
-            # No more tool calls to process yet
-            return None
-
         tool_start_idx = tool_start_positions[self.current_tool_index]
         # Find where this tool call ends (or current position if not ended yet)
         tool_end_idx = current_text.find(self.tool_call_end_token, tool_start_idx)

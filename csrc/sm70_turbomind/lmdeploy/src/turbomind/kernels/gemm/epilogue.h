@@ -12,6 +12,7 @@
 #include "src/turbomind/kernels/gemm/smem_copy.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
+#include "../../../../../../sm70_tile_runtime_signal.cuh"
 
 namespace turbomind::gemm {
 
@@ -194,6 +195,9 @@ struct EpilogueParam {
     void*        moe_reduce_out;
     const float* moe_sorted_weights;
     const int*   moe_offsets;
+
+    bool tile_allreduce;
+    TileAllReduceParam tile_allreduce_param;
 };
 
 template<class Tc_,
@@ -341,6 +345,232 @@ struct Epilogue_ {
         }
     }
 
+    __device__ void PublishTileAllReduceFlag(const int4&          tile_offset,
+                                             int                  tile_id,
+                                             bool                 is_last,
+                                             const EpilogueParam& param)
+    {
+        if (!param.tile_allreduce || !is_last) {
+            return;
+        }
+        const auto& tile_ar = param.tile_allreduce_param;
+        if (tile_ar.world_size != 2 || tile_ar.tile_numel <= 0) {
+            return;
+        }
+        // The first model path is intentionally M=1 and row-major N tiles.
+        if (tile_offset.x != 0 || tile_offset.w != 0) {
+            return;
+        }
+        const int col_begin = tile_offset.y * N;
+        if (col_begin >= tile_ar.output_numel) {
+            return;
+        }
+        const int col_end = min(col_begin + N, tile_ar.output_numel);
+
+        // Make all CTA stores visible before any peer-visible flag is set.
+        __threadfence_system();
+        __syncthreads();
+
+        const int first_signal = col_begin / tile_ar.tile_numel;
+        const int last_signal  = (col_end - 1) / tile_ar.tile_numel;
+        for (int signal_id = first_signal; signal_id <= last_signal; ++signal_id) {
+            if (signal_id < 0 || signal_id >= vllm::sm70_tile_runtime::kMaxBlocks) {
+                continue;
+            }
+            const int signal_begin = signal_id * tile_ar.tile_numel;
+            const int signal_end   = min(signal_begin + tile_ar.tile_numel,
+                                         tile_ar.output_numel);
+            if (signal_begin < col_begin || signal_end > col_end) {
+                continue;
+            }
+
+            const auto flag =
+                reinterpret_cast<vllm::sm70_tile_runtime::Signal*>(
+                    tile_ar.self_signal)->_flag[signal_id] +
+                1;
+            if (threadIdx.x < tile_ar.world_size) {
+                auto* peer_signal =
+                    reinterpret_cast<vllm::sm70_tile_runtime::Signal*>(
+                        tile_ar.signals[threadIdx.x]);
+                auto* peer_flag = &peer_signal->start[signal_id][tile_ar.rank];
+                vllm::sm70_tile_runtime::store_flag_sys_visible(peer_flag, flag);
+            }
+        }
+    }
+
+    template<class VecC, class Pred>
+    __device__ void StoreTileAllReduceC(const VecC&           vec_C,
+                                        const MatrixData&     c,
+                                        int2                  cs0,
+                                        const int4&           tile_offset,
+                                        bool                  is_last,
+                                        Pred&                 pred,
+                                        const EpilogueParam&  param)
+    {
+        if (!param.tile_allreduce || !is_last) {
+            return;
+        }
+        const auto& tile_ar = param.tile_allreduce_param;
+        if (tile_ar.world_size != 2 || tile_ar.tile_numel <= 0 ||
+            tile_ar.rank_data == nullptr || tile_ar.output == nullptr) {
+            return;
+        }
+        if (tile_offset.x != 0 || tile_offset.w != 0) {
+            return;
+        }
+
+        const int col_begin = tile_offset.y * N;
+        if (col_begin >= tile_ar.output_numel) {
+            return;
+        }
+        const int col_end = min(col_begin + N, tile_ar.output_numel);
+        const int first_signal = col_begin / tile_ar.tile_numel;
+        const int last_signal  = (col_end - 1) / tile_ar.tile_numel;
+        auto* self_signal =
+            reinterpret_cast<vllm::sm70_tile_runtime::Signal*>(
+                tile_ar.self_signal);
+
+        for (int signal_id = first_signal; signal_id <= last_signal; ++signal_id) {
+            if (signal_id < 0 ||
+                signal_id >= vllm::sm70_tile_runtime::kMaxBlocks) {
+                return;
+            }
+            const int signal_begin = signal_id * tile_ar.tile_numel;
+            const int signal_end   = min(signal_begin + tile_ar.tile_numel,
+                                         tile_ar.output_numel);
+            if (signal_begin < col_begin || signal_end > col_end) {
+                return;
+            }
+
+            const auto flag = self_signal->_flag[signal_id] + 1;
+            if (threadIdx.x < tile_ar.world_size) {
+                auto* self_flag = &self_signal->start[signal_id][threadIdx.x];
+                while (vllm::sm70_tile_runtime::load_flag_sys_visible(
+                           self_flag) != flag) {
+                }
+            }
+            __syncthreads();
+        }
+
+        const auto rank_data =
+            *reinterpret_cast<const vllm::sm70_tile_runtime::RankData*>(
+                tile_ar.rank_data);
+        const int peer_rank = 1 - tile_ar.rank;
+        const auto* peer_base =
+            reinterpret_cast<const char*>(rank_data.ptrs[peer_rank]);
+        auto* output_base = reinterpret_cast<char*>(tile_ar.output);
+
+        constexpr int dc = sizeof(Tc) * Map::kDeltaC;
+        const int ds = sizeof(Tc) * Map::kDeltaS * c.ptr.stride;
+        const auto offset =
+            sizeof(Tc) * dot(cs0, long2{1, c.ptr.stride});
+        const char* peer_ptr = peer_base + offset;
+        char* output_ptr = output_base + offset;
+
+        PRAGMA_UNROLL
+        for (int s = 0; s < S; ++s) {
+            PRAGMA_UNROLL
+            for (int c = 0; c < C; ++c) {
+                if (pred(s, c)) {
+                    OutputC<Tc> peer;
+                    Load(peer, reinterpret_cast<const Tc*>(peer_ptr));
+                    using namespace ops;
+                    const auto self = cast<Tc>(vec_C[s][c]);
+                    const auto reduced =
+                        cast<Tc>(cast<float>(self) + cast<float>(peer));
+                    Store(reinterpret_cast<Tc*>(output_ptr), reduced);
+                }
+                peer_ptr += dc;
+                output_ptr += dc;
+            }
+            peer_ptr -= dc * C;
+            output_ptr -= dc * C;
+            peer_ptr += ds;
+            output_ptr += ds;
+        }
+
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int signal_id = first_signal; signal_id <= last_signal; ++signal_id) {
+                self_signal->_flag[signal_id] = self_signal->_flag[signal_id] + 1;
+            }
+        }
+    }
+
+    __device__ bool StoreTailAllReduceC(const int4&          tile_offset,
+                                        bool                 is_last,
+                                        const EpilogueParam& param)
+    {
+        if (!param.tile_allreduce || !is_last) {
+            return false;
+        }
+        const auto& tile_ar = param.tile_allreduce_param;
+        if (tile_ar.world_size != 2 || tile_ar.rank_data == nullptr ||
+            tile_ar.output == nullptr || tile_ar.output_numel <= 0 ||
+            (tile_ar.output_numel & 1)) {
+            return false;
+        }
+        // Narrow first model path: M=1, row-major dense down_proj output.
+        if (tile_offset.x != 0 || tile_offset.w != 0) {
+            return false;
+        }
+        const int cta_count = (tile_ar.output_numel + N - 1) / N;
+        if (cta_count <= 0) {
+            return false;
+        }
+
+        constexpr int signal_id = vllm::sm70_tile_runtime::kMaxBlocks - 1;
+        auto* self_signal =
+            reinterpret_cast<vllm::sm70_tile_runtime::Signal*>(
+                tile_ar.self_signal);
+        const auto epoch = self_signal->_flag[signal_id];
+        const auto target = (epoch + 1) * cta_count;
+
+        // Every producer CTA releases its staging stores before contributing to
+        // the completion counter. Only one completed CTA stays alive as the
+        // reduce worker; the rest exit the GEMM kernel normally.
+        __syncthreads();
+        __threadfence_system();
+        if (threadIdx.x == 0) {
+            atomicAdd(&self_signal->start[signal_id][tile_ar.rank],
+                      static_cast<vllm::sm70_tile_runtime::FlagType>(1));
+        }
+
+        if (tile_offset.y != 0) {
+            return true;
+        }
+
+        if (threadIdx.x < tile_ar.world_size) {
+            auto* rank_signal =
+                reinterpret_cast<vllm::sm70_tile_runtime::Signal*>(
+                    tile_ar.signals[threadIdx.x]);
+            auto* counter = &rank_signal->start[signal_id][threadIdx.x];
+            while (vllm::sm70_tile_runtime::load_flag_sys_visible(counter) <
+                   target) {
+            }
+        }
+        __syncthreads();
+
+        const auto rank_data =
+            *reinterpret_cast<const vllm::sm70_tile_runtime::RankData*>(
+                tile_ar.rank_data);
+        const auto* rank0 =
+            reinterpret_cast<const half2*>(rank_data.ptrs[0]);
+        const auto* rank1 =
+            reinterpret_cast<const half2*>(rank_data.ptrs[1]);
+        auto* output = reinterpret_cast<half2*>(tile_ar.output);
+        const int half2_count = tile_ar.output_numel / 2;
+        for (int idx = threadIdx.x; idx < half2_count; idx += blockDim.x) {
+            output[idx] = __hadd2(rank0[idx], rank1[idx]);
+        }
+
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            self_signal->_flag[signal_id] = epoch + 1;
+        }
+        return true;
+    }
+
 #if 0
     template<class FragC, class Pred>
     __device__ void
@@ -461,6 +691,7 @@ struct Epilogue_ {
 
         const MatrixData c = resolve<Tc, kMode>(param.c, tile_offset.w);
 
+        bool publish_tile_allreduce = false;
         if (param.moe_weighted_reduce) {
             if constexpr (std::is_same_v<Tc, half_t>) {
                 StoreMoeWeightedReduce(tmp_C, cs0, tile_offset.w, pred, param);
@@ -487,6 +718,17 @@ struct Epilogue_ {
         }
         else {
             StoreC<Tc>(tmp_C, c, cs0, pred);
+            publish_tile_allreduce = true;
+        }
+
+        if (publish_tile_allreduce) {
+            if (param.tile_allreduce && param.tile_allreduce_param.kernel_reducer_blocks > 0) {
+                PublishTileAllReduceFlag(tile_offset, tile_id, is_last, param);
+            }
+            else if (!StoreTailAllReduceC(tile_offset, is_last, param)) {
+                PublishTileAllReduceFlag(tile_offset, tile_id, is_last, param);
+                StoreTileAllReduceC(tmp_C, c, cs0, tile_offset, is_last, pred, param);
+            }
         }
     }
 };

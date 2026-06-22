@@ -1,10 +1,10 @@
 import torch
-import traceback
+import logging
 import os
 try:
-    import flash_attn_v100_cuda
-except ImportError:
     from . import flash_attn_v100_cuda
+except ImportError:
+    import flash_attn_v100_cuda
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Union
 
@@ -18,6 +18,7 @@ VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _DecodePlan:
@@ -38,6 +39,17 @@ class _DecodeWorkspace:
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def _copy_bhmd_to_bmhd_out(
+    out_bhmd: torch.Tensor,
+    out_bmhd: Optional[torch.Tensor],
+) -> torch.Tensor:
+    out = out_bhmd.permute(0, 2, 1, 3).contiguous()
+    if out_bmhd is not None:
+        out_bmhd.copy_(out)
+        return out_bmhd
+    return out
 
 
 def _is_fake_tensor(x: torch.Tensor) -> bool:
@@ -312,10 +324,7 @@ def _get_decode_partition_size(
 ) -> int:
     raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     if raw is None:
-        # Keep the default arithmetic order identical to the legacy V100 decode
-        # kernel. Larger partitions reduce launch/reduce work but change the
-        # softmax reduction boundary and can flip greedy tokens.
-        return DEFAULT_DECODE_PARTITION_SIZE
+        return _select_default_decode_partition_size(max_seq_len_hint)
     try:
         value = int(raw)
     except ValueError as exc:
@@ -323,10 +332,28 @@ def _get_decode_partition_size(
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
             f"{VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
         ) from exc
+    return _validate_decode_partition_size(
+        value,
+        "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
+    )
+
+
+def _select_default_decode_partition_size(
+    max_seq_len_hint: Optional[int],
+) -> int:
+    if max_seq_len_hint is None:
+        return DEFAULT_DECODE_PARTITION_SIZE
+
+    seq_len = max(1, int(max_seq_len_hint))
+    if seq_len >= 32768:
+        return 1024
+    return DEFAULT_DECODE_PARTITION_SIZE
+
+
+def _validate_decode_partition_size(value: int, name: str) -> int:
     if value not in VALID_DECODE_PARTITION_SIZES:
         raise ValueError(
-            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{VALID_DECODE_PARTITION_SIZES}, got {value}"
+            f"{name} must be one of {VALID_DECODE_PARTITION_SIZES}, got {value}"
         )
     return value
 
@@ -450,7 +477,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap, alibi_slopes, return_softmax
         )
 
-        out = out_.permute(0, 2, 1, 3).contiguous()
+        out = _copy_bhmd_to_bmhd_out(out_, out)
 
         if is_grad_enabled and q.requires_grad:
             ctx.save_for_backward(q_, k_, v_, out_, lse_, rng_state)
@@ -525,15 +552,25 @@ def flash_attn_func(
             torch.is_grad_enabled(),
             out,
         )
-    except Exception as e:
-        print("VOLTA FA2 FAILED in flash_attn_func")
-        print(f"  q.shape = {list(q.shape)}, dtype = {q.dtype}, device = {q.device}, contiguous = {q.is_contiguous()}")
-        print(f"  k.shape = {list(k.shape)}, dtype = {k.dtype}, device = {k.device}, contiguous = {k.is_contiguous()}")
-        print(f"  v.shape = {list(v.shape)}, dtype = {v.dtype}, device = {v.device}, contiguous = {v.is_contiguous()}")
-        print(f"  causal = {causal}, window_size = {window_size}, softmax_scale = {softmax_scale}")
-        print(f"  Exception type: {type(e).__name__}")
-        print(f"  Exception message: {e}")
-        traceback.print_exc()
+    except Exception:
+        logger.debug(
+            "FlashAttention-V100 flash_attn_func failed "
+            "(q=%s/%s/%s, k=%s/%s/%s, v=%s/%s/%s, causal=%s, "
+            "window_size=%s, softmax_scale=%s)",
+            list(q.shape),
+            q.dtype,
+            q.device,
+            list(k.shape),
+            k.dtype,
+            k.device,
+            list(v.shape),
+            v.dtype,
+            v.device,
+            causal,
+            window_size,
+            softmax_scale,
+            exc_info=True,
+        )
         raise
 
 
@@ -702,6 +739,87 @@ def flash_attn_decode_paged(
     )
 
 
+def flash_attn_decode_paged_xqa_available() -> bool:
+    return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd")
+
+
+def flash_attn_decode_paged_xqa(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    window_size: tuple = (-1, -1),
+    max_seq_len_hint: Optional[int] = None,
+    workspace_seq_capacity_hint: Optional[int] = None,
+    active_num_partitions: Optional[torch.Tensor] = None,
+):
+    if not flash_attn_decode_paged_xqa_available():
+        raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+    batch_capacity = q.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    if not _decode_dynamic_partitions_enabled():
+        max_seq_len_hint = None
+        workspace_seq_capacity_hint = None
+        active_num_partitions = None
+    plan = _get_decode_plan(
+        q,
+        k_cache,
+        block_table,
+        max_seq_len_hint=max_seq_len_hint,
+        batch_size_hint=batch_capacity,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+        active_num_partitions=active_num_partitions,
+    )
+    tmp_out, max_logits, exp_sums, active_num_partitions = (
+        _get_decode_workspace_for_plan(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            plan=plan,
+            active_num_partitions=active_num_partitions,
+        )
+    )
+
+    return flash_attn_v100_cuda.decode_paged_xqa_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        active_num_partitions,
+        softmax_scale,
+        plan.partition_size,
+        plan.launch_num_partitions,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        int(window_size_left),
+        int(window_size_right),
+    )
+
+
 def flash_attn_decode_paged_wmma(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -844,6 +962,7 @@ def flash_attn_prefill_paged(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    out_original = out
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
@@ -870,7 +989,7 @@ def flash_attn_prefill_paged(
         int(window_size_left),
         int(window_size_right),
     )
-    return out_.permute(0, 2, 1, 3).contiguous()
+    return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
 def flash_attn_prefill_paged_bfla(
@@ -892,6 +1011,7 @@ def flash_attn_prefill_paged_bfla(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    out_original = out
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
@@ -921,7 +1041,7 @@ def flash_attn_prefill_paged_bfla(
         int(window_size_left),
         int(window_size_right),
     )
-    return out_.permute(0, 2, 1, 3).contiguous()
+    return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
 def flash_attn_prefill_paged_splitkv(
@@ -943,6 +1063,7 @@ def flash_attn_prefill_paged_splitkv(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    out_original = out
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
@@ -971,7 +1092,7 @@ def flash_attn_prefill_paged_splitkv(
         int(split_kv_tokens),
         int(max_seq_len_hint),
     )
-    return out_.permute(0, 2, 1, 3).contiguous()
+    return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
 def flash_attn_prefill_paged_bhmd(
@@ -1022,6 +1143,8 @@ __all__ = [
     "flash_attn_lse",
     "flash_attn_qk_scores",
     "flash_attn_decode_paged",
+    "flash_attn_decode_paged_xqa",
+    "flash_attn_decode_paged_xqa_available",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

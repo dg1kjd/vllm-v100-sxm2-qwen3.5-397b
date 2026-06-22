@@ -74,20 +74,24 @@ def _sm70_mtp_profile_interval() -> int:
     return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
 
 
+def _is_dflash_method(method: str | None) -> bool:
+    return method in ("dflash", "dflash_ddtree")
+
+
 def _spec_debug_corruption_enabled(method: str) -> bool:
-    if method == "dflash" and envs.VLLM_DFLASH_DEBUG_CORRUPTION:
+    if _is_dflash_method(method) and envs.VLLM_DFLASH_DEBUG_CORRUPTION:
         return True
     return envs.VLLM_SPEC_DEBUG_CORRUPTION
 
 
 def _spec_dump_draft_logits_enabled(method: str) -> bool:
-    if method == "dflash" and envs.VLLM_DFLASH_DUMP_DRAFT_LOGITS:
+    if _is_dflash_method(method) and envs.VLLM_DFLASH_DUMP_DRAFT_LOGITS:
         return True
     return envs.VLLM_SPEC_DUMP_DRAFT_LOGITS
 
 
 def _dump_spec_debug(payload: dict[str, Any], method: str, suffix: str) -> str:
-    prefix = "dflash" if method == "dflash" else f"spec_{method}"
+    prefix = method if _is_dflash_method(method) else f"spec_{method}"
     dump_path = f"/tmp/{prefix}_{suffix}_pid{os.getpid()}.pt"
     torch.save(payload, dump_path)
     return dump_path
@@ -194,7 +198,10 @@ class SpecDecodeBaseProposer:
             1 if not self.parallel_drafting else self.num_speculative_tokens
         )
         self.net_num_new_slots_per_request = self.extra_slots_per_request - (
-            1 if (self.pass_hidden_states_to_model and self.method != "dflash") else 0
+            1
+            if (self.pass_hidden_states_to_model
+                and not _is_dflash_method(self.method))
+            else 0
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
 
@@ -873,7 +880,7 @@ class SpecDecodeBaseProposer:
         )
         profile_total_start = self._sm70_mtp_profile_start(profile_events)
 
-        if self.method in ("eagle3", "dflash"):
+        if self.method == "eagle3" or _is_dflash_method(self.method):
             assert isinstance(
                 self.model,
                 (
@@ -1483,7 +1490,7 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model", "dflash")
+        return self.method not in ("mtp", "draft_model", "dflash", "dflash_ddtree")
 
     def prepare_next_token_ids_cpu(
         self,
@@ -2325,7 +2332,9 @@ def compute_probs_and_sample_next_token(
     # configured, sample draft tokens from the top-k proposal only. The target
     # sampler still applies the official top-p policy; rejection sampling
     # corrects the final distribution.
-    draft_top_p = None if sampling_metadata.top_k is not None else sampling_metadata.top_p
+    draft_top_p = (
+        None if sampling_metadata.top_k is not None else sampling_metadata.top_p
+    )
     top_p = _expand_sampling_param_for_logits(draft_top_p, logits.shape[0])
     logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)

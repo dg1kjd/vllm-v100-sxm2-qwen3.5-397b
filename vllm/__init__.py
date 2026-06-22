@@ -7,6 +7,13 @@
 from .version import __version__, __version_tuple__  # isort:skip
 
 import typing
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"The cuda\.(cudart|nvrtc) module is deprecated.*",
+    category=FutureWarning,
+)
 
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any

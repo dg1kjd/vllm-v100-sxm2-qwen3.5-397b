@@ -96,9 +96,15 @@ class FlashInferTrtllmNvFp4LinearKernel(NvFp4LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
+        if compute_capability is not None:
+            if compute_capability < 100:
+                return False, "FlashInfer TRTLLM NVFP4 requires >=sm_100"
+        elif not current_platform.has_device_capability(100):
+            return False, "FlashInfer TRTLLM NVFP4 requires >=sm_100"
+
         if has_flashinfer():
             return True, None
-        return False, "FlashInfer required"
+        return False, "FlashInfer + >=sm_100 required"
 
     @classmethod
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
@@ -163,9 +169,15 @@ class FlashInferCudnnNvFp4LinearKernel(NvFp4LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
+        if compute_capability is not None:
+            if compute_capability < 100:
+                return False, "FlashInfer cuDNN NVFP4 requires >=sm_100"
+        elif not current_platform.has_device_capability(100):
+            return False, "FlashInfer cuDNN NVFP4 requires >=sm_100"
+
         if has_flashinfer():
             return True, None
-        return False, "FlashInfer required"
+        return False, "FlashInfer + >=sm_100 required"
 
     @classmethod
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:

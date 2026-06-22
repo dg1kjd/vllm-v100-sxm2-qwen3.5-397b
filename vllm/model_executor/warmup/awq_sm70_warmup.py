@@ -532,6 +532,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
         ):
             topk_weights = torch.empty(top_k, dtype=torch.float32, device=device)
             topk_weights.fill_(1.0 / max(top_k, 1))
+            sorted_weights = torch.empty(top_k, dtype=torch.float32, device=device)
             ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
             legacy_w13_ptrs_w = torch.empty(
                 top_k, ptr_row_bytes, dtype=torch.uint8, device=device
@@ -548,6 +549,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
             legacy_output = torch.empty(
                 (1, hidden_size), dtype=torch.float16, device=device
             )
+            legacy_output.zero_()
             legacy_offsets = torch.empty(
                 top_k + 1, dtype=torch.int32, device=device
             )
@@ -563,6 +565,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
                 compact_input,
                 intermediate,
                 sorted_output,
+                sorted_weights,
                 legacy_w13_ptrs_w,
                 legacy_w13_ptrs_s,
                 legacy_w2_ptrs_w,

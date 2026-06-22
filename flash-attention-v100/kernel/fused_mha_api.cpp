@@ -21,6 +21,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &flash_attention_decode_paged,
         "FlashAttention decode over paged KV cache (Volta)");
     m.def(
+        "decode_paged_xqa_fwd",
+        &flash_attention_decode_paged_xqa,
+        "FlashAttention XQA decode over paged KV cache (Volta)");
+    m.def(
         "decode_paged_wmma_fwd",
         &flash_attention_decode_paged_wmma,
         "FlashAttention single-query decode through paged-prefill WMMA order (Volta)");

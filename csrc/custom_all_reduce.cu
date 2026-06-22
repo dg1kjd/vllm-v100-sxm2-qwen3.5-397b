@@ -224,6 +224,137 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                   reinterpret_cast<int64_t*>(output.data_ptr()));
 }
 
+void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
+                             fptr_t _reg_buffer,
+                             int64_t reg_buffer_sz_bytes,
+                             int64_t tile_numel, int64_t engine_blocks,
+                             int64_t compute_iters) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.numel(), out.numel());
+  TORCH_CHECK(_is_weak_contiguous(inp));
+  TORCH_CHECK(_is_weak_contiguous(out));
+  TORCH_CHECK(tile_numel > 0);
+  TORCH_CHECK(engine_blocks >= 0);
+  TORCH_CHECK(compute_iters >= 0);
+
+  auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  TORCH_CHECK(reg_buffer != nullptr,
+              "SM70 tile runtime prototype requires a registered staging "
+              "buffer.");
+  TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+
+  switch (out.scalar_type()) {
+    case at::ScalarType::Float: {
+      fa->tile_runtime_allreduce<float>(
+          stream, reinterpret_cast<const float*>(inp.data_ptr()),
+          reinterpret_cast<float*>(reg_buffer),
+          reinterpret_cast<float*>(out.data_ptr()), out.numel(), tile_numel,
+          engine_blocks, compute_iters);
+      break;
+    }
+    case at::ScalarType::Half: {
+      fa->tile_runtime_allreduce<half>(
+          stream, reinterpret_cast<const half*>(inp.data_ptr()),
+          reinterpret_cast<half*>(reg_buffer),
+          reinterpret_cast<half*>(out.data_ptr()), out.numel(), tile_numel,
+          engine_blocks, compute_iters);
+      break;
+    }
+    default:
+      throw std::runtime_error(
+          "SM70 tile runtime prototype supports float32 and float16 only");
+  }
+}
+
+void tile_runtime_all_reduce_engine(fptr_t _fa, torch::Tensor& inp,
+                                    torch::Tensor& out, fptr_t _reg_buffer,
+                                    int64_t reg_buffer_sz_bytes,
+                                    int64_t tile_numel,
+                                    int64_t producer_blocks,
+                                    int64_t reducer_blocks,
+                                    int64_t compute_iters) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.numel(), out.numel());
+  TORCH_CHECK(_is_weak_contiguous(inp));
+  TORCH_CHECK(_is_weak_contiguous(out));
+  TORCH_CHECK(tile_numel > 0);
+  TORCH_CHECK(producer_blocks >= 0);
+  TORCH_CHECK(reducer_blocks >= 0);
+  TORCH_CHECK(compute_iters >= 0);
+
+  auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  TORCH_CHECK(reg_buffer != nullptr,
+              "SM70 tile runtime engine requires a registered staging buffer.");
+  TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+
+  switch (out.scalar_type()) {
+    case at::ScalarType::Float: {
+      fa->tile_runtime_allreduce_engine<float>(
+          stream, reinterpret_cast<const float*>(inp.data_ptr()),
+          reinterpret_cast<float*>(reg_buffer),
+          reinterpret_cast<float*>(out.data_ptr()), out.numel(), tile_numel,
+          producer_blocks, reducer_blocks, compute_iters);
+      break;
+    }
+    case at::ScalarType::Half: {
+      fa->tile_runtime_allreduce_engine<half>(
+          stream, reinterpret_cast<const half*>(inp.data_ptr()),
+          reinterpret_cast<half*>(reg_buffer),
+          reinterpret_cast<half*>(out.data_ptr()), out.numel(), tile_numel,
+          producer_blocks, reducer_blocks, compute_iters);
+      break;
+    }
+    default:
+      throw std::runtime_error(
+          "SM70 tile runtime engine supports float32 and float16 only");
+  }
+}
+
+void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
+                              torch::Tensor& out, int64_t tile_numel,
+                              int64_t reducer_blocks) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(staging));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(staging.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(staging.numel(), out.numel());
+  TORCH_CHECK(_is_weak_contiguous(staging));
+  TORCH_CHECK(_is_weak_contiguous(out));
+  TORCH_CHECK(tile_numel > 0);
+  TORCH_CHECK(reducer_blocks >= 0);
+
+  switch (out.scalar_type()) {
+    case at::ScalarType::Float: {
+      fa->tile_runtime_wait_reduce<float>(
+          stream, reinterpret_cast<float*>(staging.data_ptr()),
+          reinterpret_cast<float*>(out.data_ptr()), out.numel(), tile_numel,
+          reducer_blocks);
+      break;
+    }
+    case at::ScalarType::Half: {
+      fa->tile_runtime_wait_reduce<half>(
+          stream, reinterpret_cast<half*>(staging.data_ptr()),
+          reinterpret_cast<half*>(out.data_ptr()), out.numel(), tile_numel,
+          reducer_blocks);
+      break;
+    }
+    default:
+      throw std::runtime_error(
+          "SM70 tile runtime wait-reduce supports float32 and float16 only");
+  }
+}
+
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
 }

@@ -155,6 +155,57 @@ def all_reduce_sum2_fake(
     return torch.empty_like(tensor_a)
 
 
+def sm70_awq_mlp_down_tile_all_reduce(
+    tensor: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._sm70_awq_mlp_down_tile_all_reduce_out_place(tensor)
+
+
+def sm70_awq_mlp_down_tile_all_reduce_fake(
+    tensor: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return torch.empty_like(tensor)
+
+
+def sm70_awq_mlp_down_tile_gemm_reduce(
+    tensor: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    group_name: str,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._sm70_awq_mlp_down_tile_gemm_reduce_out_place(
+        tensor, qweight, scales, group_size, k_ld, q_ld
+    )
+
+
+def sm70_awq_mlp_down_tile_gemm_reduce_fake(
+    tensor: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    group_name: str,
+) -> torch.Tensor:
+    del scales, group_size, k_ld, q_ld, group_name
+    return torch.empty(
+        (tensor.size(0), qweight.size(-1) * 8),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -285,6 +336,18 @@ direct_register_custom_op(
     op_name="all_reduce_sum2",
     op_func=all_reduce_sum2,
     fake_impl=all_reduce_sum2_fake,
+)
+
+direct_register_custom_op(
+    op_name="sm70_awq_mlp_down_tile_all_reduce",
+    op_func=sm70_awq_mlp_down_tile_all_reduce,
+    fake_impl=sm70_awq_mlp_down_tile_all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="sm70_awq_mlp_down_tile_gemm_reduce",
+    op_func=sm70_awq_mlp_down_tile_gemm_reduce,
+    fake_impl=sm70_awq_mlp_down_tile_gemm_reduce_fake,
 )
 
 direct_register_custom_op(
@@ -580,6 +643,98 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce_sum2(input_a, input_b)
+
+    def sm70_awq_mlp_down_tile_all_reduce(
+        self, input_: torch.Tensor
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.sm70_awq_mlp_down_tile_all_reduce(
+                input_, group_name=self.unique_name
+            )
+        return self._sm70_awq_mlp_down_tile_all_reduce_out_place(input_)
+
+    def _sm70_awq_mlp_down_tile_all_reduce_out_place(
+        self, input_: torch.Tensor
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        tile_ar = getattr(
+            self.device_communicator, "sm70_awq_mlp_down_tile_all_reduce", None
+        )
+        if tile_ar is not None:
+            out = tile_ar(input_)
+            if out is not None:
+                return out
+        return self.device_communicator.all_reduce(input_)
+
+    def sm70_awq_mlp_down_tile_gemm_reduce(
+        self,
+        input_: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            from vllm import _sm70_ops as sm70_ops
+
+            out = torch.empty(
+                (input_.size(0), qweight.size(-1) * 8),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
+            sm70_ops.awq_gemm_sm70_out(
+                out, input_, qweight, scales, group_size, k_ld, q_ld, False
+            )
+            return out
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.sm70_awq_mlp_down_tile_gemm_reduce(
+                input_,
+                qweight,
+                scales,
+                group_size,
+                k_ld,
+                q_ld,
+                group_name=self.unique_name,
+            )
+        return self._sm70_awq_mlp_down_tile_gemm_reduce_out_place(
+            input_, qweight, scales, group_size, k_ld, q_ld
+        )
+
+    def _sm70_awq_mlp_down_tile_gemm_reduce_out_place(
+        self,
+        input_: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        tile_reduce = getattr(
+            self.device_communicator, "sm70_awq_mlp_down_tile_gemm_reduce", None
+        )
+        if tile_reduce is not None:
+            out = tile_reduce(input_, qweight, scales, group_size, k_ld, q_ld)
+            if out is not None:
+                return out
+        from vllm import _sm70_ops as sm70_ops
+
+        staging = torch.empty(
+            (input_.size(0), qweight.size(-1) * 8),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        sm70_ops.awq_gemm_sm70_out(
+            staging, input_, qweight, scales, group_size, k_ld, q_ld, False
+        )
+        return self.device_communicator.all_reduce(staging)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

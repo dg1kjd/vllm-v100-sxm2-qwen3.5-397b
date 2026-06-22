@@ -761,7 +761,9 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     )
     runner.rejection_sampler = Mock(return_value="sampler_output")
     runner.sampler = Mock()
+    runner.speculative_config = None
     runner._draft_prob_req_ids = ["req_c", "req_a", "req_b"]
+    runner._draft_prob_token_ids = [[3], [1, 2], []]
     runner._draft_probs = torch.arange(3 * 3 * 4, dtype=torch.float32).reshape(3, 3, 4)
 
     spec_decode_metadata = SpecDecodeMetadata.make_dummy(
@@ -769,8 +771,17 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
         device=torch.device("cpu"),
     )
     logits = torch.randn(6, 4)
+    scheduler_output = SimpleNamespace(scheduled_ddtree_payloads={})
+    sample_hidden_states = torch.randn(6, 4)
 
-    output = GPUModelRunner._sample(runner, logits, spec_decode_metadata)
+    output = GPUModelRunner._sample(
+        runner,
+        scheduler_output,
+        logits,
+        spec_decode_metadata,
+        sample_hidden_states,
+        logits_indices=None,
+    )
 
     assert output == "sampler_output"
     passed_draft_probs = runner.rejection_sampler.call_args.args[1]
@@ -1003,8 +1014,8 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
 
 
 @pytest.mark.skipif(
-    current_platform.is_rocm(),
-    reason="Attention backend FLASHINFER is not supported on ROCm.",
+    current_platform.is_rocm() or current_platform.is_device_capability((7, 0)),
+    reason="Attention backend FLASHINFER is not supported on ROCm or SM70.",
 )
 def test_hybrid_attention_mamba_tensor_shapes():
     """
@@ -1439,8 +1450,8 @@ def test_is_uniform_decode() -> None:
 
 
 @pytest.mark.skipif(
-    current_platform.is_rocm(),
-    reason="Attention backend FLASHINFER is not supported on ROCm.",
+    current_platform.is_rocm() or current_platform.is_device_capability((7, 0)),
+    reason="Attention backend FLASHINFER is not supported on ROCm or SM70.",
 )
 def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
     """Test that a ValueError is raised when max_num_seqs exceeds the

@@ -16,6 +16,8 @@ from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_sm70_awq_mlp_down_tile_all_reduce,
+    tensor_model_parallel_sm70_awq_mlp_down_tile_gemm_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -43,6 +45,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN: set[str] = set()
 
 
 def _interleave_output_rows_for_gated_silu(weight: torch.Tensor) -> torch.Tensor:
@@ -91,6 +94,100 @@ def _maybe_sm70_dense_forward(
     if bias is not None:
         out = out + bias
     return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
+def _maybe_sm70_awq_mlp_down_tile_all_reduce(
+    layer: torch.nn.Module,
+    output_parallel: torch.Tensor,
+) -> torch.Tensor | None:
+    if not envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR:
+        return None
+    if getattr(layer, "prefix", "").rsplit(".", 1)[-1] != "down_proj":
+        return None
+    if getattr(layer, "tp_size", 1) != 2:
+        return None
+    if not getattr(layer, "_awq_sm70_prepared", False):
+        return None
+    if output_parallel.dtype != torch.float16:
+        return None
+    if output_parallel.shape[-1] != getattr(layer, "output_size", None):
+        return None
+
+    if output_parallel.stride(-1) != 1:
+        output_parallel = output_parallel.contiguous()
+
+    return tensor_model_parallel_sm70_awq_mlp_down_tile_all_reduce(output_parallel)
+
+
+def _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    prefix = getattr(layer, "prefix", "")
+
+    def trace_route(reason: str) -> None:
+        if not (
+            envs.VLLM_TP_ALLREDUCE_TRACE
+            and envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
+            and prefix.rsplit(".", 1)[-1] == "down_proj"
+        ):
+            return
+        if reason in _SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN:
+            return
+        _SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN.add(reason)
+        logger.warning(
+            "SM70 AWQ MLP down tile-overlap route prefix=%s reason=%s "
+            "x_shape=%s x_dtype=%s bias=%s tp_size=%s prepared=%s "
+            "output_size=%s",
+            prefix,
+            reason,
+            tuple(x.shape),
+            x.dtype,
+            bias is not None,
+            getattr(layer, "tp_size", None),
+            getattr(layer, "_awq_sm70_prepared", False),
+            getattr(layer, "output_size", None),
+        )
+
+    if not envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP:
+        return None
+    if bias is not None:
+        trace_route("skip_bias")
+        return None
+    if prefix.rsplit(".", 1)[-1] != "down_proj":
+        return None
+    if getattr(layer, "tp_size", 1) != 2:
+        trace_route("skip_tp_size")
+        return None
+    if not getattr(layer, "_awq_sm70_prepared", False):
+        trace_route("skip_not_prepared")
+        return None
+    if x.dtype != torch.float16:
+        trace_route("skip_dtype")
+        return None
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    if x_2d.stride(-1) != 1:
+        x_2d = x_2d.contiguous()
+
+    qweight = layer._awq_sm70_weight
+    out_features = qweight.shape[-1] * 8
+    if out_features != getattr(layer, "output_size", None):
+        trace_route(f"skip_out_features_{out_features}")
+        return None
+
+    if envs.VLLM_TP_ALLREDUCE_TRACE:
+        trace_route("dispatch")
+    out_2d = tensor_model_parallel_sm70_awq_mlp_down_tile_gemm_reduce(
+        x_2d,
+        qweight,
+        layer._awq_sm70_scales,
+        layer._awq_sm70_group_size,
+        layer._awq_sm70_k_ld,
+        layer._awq_sm70_q_ld,
+    )
+    return out_2d.reshape(*x.shape[:-1], out_features)
 
 
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -1688,14 +1785,26 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = _maybe_sm70_dense_forward(self, input_parallel, bias_)
-        if output_parallel is None:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-
+        output = None
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
+            output = _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
+                self, input_parallel, bias_
+            )
+        if output is None:
+            output_parallel = _maybe_sm70_dense_forward(self, input_parallel, bias_)
+            if output_parallel is None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias_
+                )
+
+            if self.reduce_results and self.tp_size > 1:
+                output = _maybe_sm70_awq_mlp_down_tile_all_reduce(
+                    self, output_parallel
+                )
+                if output is None:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
 
         if not self.return_bias:
             return output

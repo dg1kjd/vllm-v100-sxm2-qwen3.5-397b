@@ -49,6 +49,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_ddtree,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -99,6 +100,108 @@ _SM70_GDN_GRAPH_META: dict[str, dict[str, object]] = {}
 _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS: dict[str, int] = {}
 _SM70_GDN_PREFILL_PROFILE_COUNTS: dict[str, int] = {}
 _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
+
+
+def _ddtree_parent_ids_require_branch(
+    parent_ids: torch.Tensor | None,
+    num_tree_tokens_cpu: torch.Tensor | None,
+    num_spec_decodes: int,
+) -> bool:
+    if parent_ids is None or num_tree_tokens_cpu is None or num_spec_decodes <= 0:
+        return False
+    lengths = num_tree_tokens_cpu[:num_spec_decodes].detach().cpu().tolist()
+    return any(int(num_tree_tokens) > 0 for num_tree_tokens in lengths)
+
+
+def _dflash_ddtree_fused_gdn_enabled() -> bool:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1")
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _ddtree_queries_have_prefix_row(
+    *,
+    num_tree_tokens_cpu: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    num_spec_decodes: int,
+) -> bool:
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return True
+    lengths = num_tree_tokens_cpu[:num_spec_decodes].detach().cpu().tolist()
+    starts = spec_query_start_loc[: num_spec_decodes + 1].detach().cpu().tolist()
+    for req_row, raw_num_tree_tokens in enumerate(lengths):
+        num_tree_tokens = int(raw_num_tree_tokens)
+        if num_tree_tokens <= 0:
+            continue
+        query_len = int(starts[req_row + 1]) - int(starts[req_row])
+        if query_len != num_tree_tokens + 1:
+            return False
+    return True
+
+
+def _ddtree_depth_batches(
+    *,
+    parent_ids: torch.Tensor,
+    num_tree_tokens_cpu: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    num_spec_decodes: int,
+) -> tuple[list[tuple[int, int]], list[list[tuple[int, int, int, int]]]]:
+    """Return DDTree nodes grouped by depth.
+
+    The returned prefix rows are ``(token_row, req_row)``. They correspond to
+    the verifier row before the first draft token when query length is
+    ``tree_nodes + 1``.
+
+    Each tuple is ``(token_row, req_row, parent_slot, node_slot)``. Slot 0 is
+    the prefix-row state when a prefix row exists, otherwise the pre-tree state.
+    Non-root node slots are compact DDTree node ids.
+    """
+
+    parent_rows = parent_ids[:num_spec_decodes].detach().cpu()
+    lengths = num_tree_tokens_cpu[:num_spec_decodes].detach().cpu().tolist()
+    starts = spec_query_start_loc[: num_spec_decodes + 1].detach().cpu().tolist()
+    prefix_rows: list[tuple[int, int]] = []
+    batches_by_depth: list[list[tuple[int, int, int, int]]] = []
+    for req_row, raw_num_tree_tokens in enumerate(lengths):
+        num_tree_tokens = int(raw_num_tree_tokens)
+        if num_tree_tokens <= 0:
+            continue
+        query_len = int(starts[req_row + 1]) - int(starts[req_row])
+        if query_len == num_tree_tokens + 1:
+            token_start = int(starts[req_row]) + 1
+            prefix_rows.append((token_start - 1, req_row))
+        elif query_len == num_tree_tokens:
+            token_start = int(starts[req_row])
+        else:
+            raise RuntimeError(
+                "DDTree GDN metadata mismatch: query length must equal tree "
+                "node count or tree node count + 1 for pure-spec tree replay, "
+                f"got {query_len} and {num_tree_tokens} for request row "
+                f"{req_row}."
+            )
+        if parent_rows.shape[1] < num_tree_tokens + 1:
+            raise RuntimeError(
+                "DDTree GDN parent metadata does not cover all tree nodes: "
+                f"row width {parent_rows.shape[1]}, nodes {num_tree_tokens}."
+            )
+
+        depths = [0] * (num_tree_tokens + 1)
+        for node_slot in range(1, num_tree_tokens + 1):
+            parent = int(parent_rows[req_row, node_slot].item())
+            parent_slot = 0 if parent < 0 else parent
+            if parent_slot >= node_slot:
+                raise RuntimeError(
+                    "DDTree GDN parent metadata must be topologically sorted: "
+                    f"request row {req_row}, node slot {node_slot}, "
+                    f"parent slot {parent_slot}."
+                )
+            depth = depths[parent_slot] + 1
+            depths[node_slot] = depth
+            while len(batches_by_depth) <= depth:
+                batches_by_depth.append([])
+            batches_by_depth[depth].append(
+                (token_start + node_slot - 1, req_row, parent_slot, node_slot)
+            )
+    return prefix_rows, batches_by_depth
 
 
 def _log_runtime_route_once(message: str, *args) -> None:
@@ -515,6 +618,7 @@ def _qwen_gdn_run_recurrent_core(
             non_spec_token_indx,
             spec_sequence_masks,
             num_accepted_tokens,
+            spec_state_slot_selectors,
         ) = _qwen_gdn_metadata_tensors(
             layer_name,
             core_attn_out.device,
@@ -534,6 +638,7 @@ def _qwen_gdn_run_recurrent_core(
             non_spec_token_indx,
             spec_sequence_masks,
             num_accepted_tokens,
+            spec_state_slot_selectors,
             layer_name,
         )
 
@@ -549,6 +654,7 @@ def _qwen_gdn_run_recurrent_core(
             non_spec_token_indx,
             spec_sequence_masks,
             num_accepted_tokens,
+            spec_state_slot_selectors,
         ) = _qwen_gdn_metadata_tensors(
             layer_name,
             core_attn_out.device,
@@ -568,6 +674,7 @@ def _qwen_gdn_run_recurrent_core(
             non_spec_token_indx,
             spec_sequence_masks,
             num_accepted_tokens,
+            spec_state_slot_selectors,
             layer_name,
         )
         return core_attn_out
@@ -596,16 +703,17 @@ def _qwen_gdn_run_recurrent_core(
 def _qwen_gdn_metadata_tensors(
     layer_name: LayerNameType,
     device: torch.device,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
     resolved_layer_name = _resolve_layer_name(layer_name)
     try:
         forward_context = get_forward_context()
@@ -772,6 +880,7 @@ def _sm70_dump_gdn_spec_metadata_graph_buffers(
     non_spec_token_indx: torch.Tensor | None = None,
     spec_sequence_masks: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    spec_state_slot_selectors: torch.Tensor | None = None,
 ) -> None:
     if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_METADATA") != "1":
         return
@@ -784,6 +893,7 @@ def _sm70_dump_gdn_spec_metadata_graph_buffers(
         ("meta_non_spec_token_indx", non_spec_token_indx),
         ("meta_spec_sequence_masks", spec_sequence_masks),
         ("meta_num_accepted_tokens", num_accepted_tokens),
+        ("meta_spec_state_slot_selectors", spec_state_slot_selectors),
     ):
         if tensor is None or tensor.numel() == 0:
             continue
@@ -2472,6 +2582,280 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def _forward_ddtree_gdn_pure_spec(
+        self,
+        *,
+        mixed_qkv_spec: torch.Tensor,
+        a_spec: torch.Tensor,
+        b_spec: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        spec_query_start_loc: torch.Tensor,
+        spec_state_indices_tensor: torch.Tensor,
+        spec_state_slot_selectors: torch.Tensor | None,
+        ddtree_parent_ids: torch.Tensor,
+        ddtree_num_tree_tokens_cpu: torch.Tensor,
+        num_spec_decodes: int,
+    ) -> torch.Tensor:
+        if (
+            _dflash_ddtree_fused_gdn_enabled()
+            and spec_state_slot_selectors is not None
+            and _ddtree_queries_have_prefix_row(
+                num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu,
+                spec_query_start_loc=spec_query_start_loc,
+                num_spec_decodes=num_spec_decodes,
+            )
+        ):
+            layer_name = _encode_layer_name(self.prefix)
+            _log_runtime_route_once(
+                "Using fused DDTree Qwen GDN pure-spec verifier path."
+            )
+            profile_start = _sm70_gdn_prefill_profile_start()
+            mixed_qkv_spec = causal_conv1d_update_ddtree(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor,
+                parent_ids=ddtree_parent_ids,
+                num_accepted_tokens=spec_state_slot_selectors,
+                query_start_loc=spec_query_start_loc,
+            )
+            core_attn_out_spec, _ = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                A_log=self.A_log,
+                a=a_spec,
+                b=b_spec,
+                dt_bias=self.dt_bias,
+                mixed_qkv=mixed_qkv_spec,
+                num_q_heads=self.num_k_heads // self.tp_size,
+                num_v_heads=self.num_v_heads // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=spec_query_start_loc[:num_spec_decodes + 1],
+                ssm_state_indices=spec_state_indices_tensor,
+                num_accepted_tokens=spec_state_slot_selectors,
+                ddtree_parent_ids=ddtree_parent_ids,
+                use_qk_l2norm_in_kernel=True,
+            )
+            _sm70_gdn_prefill_profile_end(
+                layer_name,
+                "ddtree_pure_spec_fused",
+                profile_start,
+                tokens=mixed_qkv_spec.shape[0],
+                details=(
+                    f"requests={num_spec_decodes} "
+                    f"tree_tokens={int(ddtree_num_tree_tokens_cpu.sum().item())}"
+                ),
+            )
+            return core_attn_out_spec
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DDTree Qwen GDN tree replay is not CUDA-graph safe yet. "
+                "Run dflash_ddtree tree verification with eager/piecewise graph "
+                "until the tree-aware GDN kernels are fused."
+            )
+
+        layer_name = _encode_layer_name(self.prefix)
+        profile_start = _sm70_gdn_prefill_profile_start()
+        prefix_rows, depth_batches = _ddtree_depth_batches(
+            parent_ids=ddtree_parent_ids,
+            num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu,
+            spec_query_start_loc=spec_query_start_loc,
+            num_spec_decodes=num_spec_decodes,
+        )
+        total_spec_tokens = mixed_qkv_spec.shape[0]
+        core_attn_out_spec = mixed_qkv_spec.new_empty(
+            (
+                1,
+                total_spec_tokens,
+                self.num_v_heads // self.tp_size,
+                self.head_v_dim,
+            )
+        )
+        device = mixed_qkv_spec.device
+        max_state_slot = max(0, spec_state_indices_tensor.shape[1] - 1)
+        if spec_state_slot_selectors is None:
+            selector_offsets = torch.zeros(
+                (spec_state_indices_tensor.shape[0],),
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            selector_offsets = (
+                spec_state_slot_selectors[: spec_state_indices_tensor.shape[0]]
+                .to(device=device, dtype=torch.long, non_blocking=True)
+                .sub(1)
+                .clamp_(min=0, max=max_state_slot)
+            )
+        req_arange = torch.arange(
+            spec_state_indices_tensor.shape[0],
+            dtype=torch.long,
+            device=device,
+        )
+        selected_root_state_indices = spec_state_indices_tensor[
+            req_arange, selector_offsets
+        ]
+        root_state_indices = spec_state_indices_tensor[:, 0]
+        parent_zero_state_indices = selected_root_state_indices.clone()
+
+        if prefix_rows:
+            token_rows, req_rows = zip(*prefix_rows, strict=True)
+            token_idx = torch.tensor(token_rows, dtype=torch.long, device=device)
+            req_idx = torch.tensor(req_rows, dtype=torch.long, device=device)
+            input_state_idx = selected_root_state_indices[req_idx]
+            output_state_idx = root_state_indices[req_idx]
+            conv_state_indices = torch.stack(
+                (input_state_idx, output_state_idx), dim=1
+            ).to(torch.int32)
+            zero_idx = torch.zeros(
+                conv_state_indices.shape[0],
+                dtype=torch.int32,
+                device=device,
+            )
+            one_idx = torch.ones_like(zero_idx)
+
+            mixed_qkv_prefix = mixed_qkv_spec.index_select(0, token_idx)
+            mixed_qkv_prefix = causal_conv1d_update(
+                mixed_qkv_prefix,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=conv_state_indices,
+                block_idx_last_scheduled_token=one_idx,
+                initial_state_idx=zero_idx,
+                validate_data=False,
+            )
+            query_prefix, key_prefix, value_prefix = self.rearrange_mixed_qkv(
+                mixed_qkv_prefix
+            )
+            g_prefix, beta_prefix = fused_gdn_gating(
+                self.A_log,
+                a_spec.index_select(0, token_idx),
+                b_spec.index_select(0, token_idx),
+                self.dt_bias,
+            )
+            cu_seqlens = torch.arange(
+                input_state_idx.shape[0] + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            core_prefix, final_state = fused_recurrent_gated_delta_rule(
+                q=query_prefix,
+                k=key_prefix,
+                v=value_prefix,
+                g=g_prefix,
+                beta=beta_prefix,
+                initial_state=ssm_state,
+                inplace_final_state=False,
+                cu_seqlens=cu_seqlens,
+                ssm_state_indices=input_state_idx.to(torch.int32),
+                use_qk_l2norm_in_kernel=True,
+            )
+            ssm_state.index_copy_(
+                0,
+                output_state_idx.to(torch.long),
+                final_state.to(ssm_state.dtype),
+            )
+            parent_zero_state_indices.index_copy_(
+                0,
+                req_idx,
+                output_state_idx,
+            )
+            core_attn_out_spec.index_copy_(1, token_idx, core_prefix)
+
+        for depth_batch in depth_batches:
+            if not depth_batch:
+                continue
+            token_rows, req_rows, parent_slots, node_slots = zip(
+                *depth_batch, strict=True
+            )
+            device = mixed_qkv_spec.device
+            token_idx = torch.tensor(token_rows, dtype=torch.long, device=device)
+            req_idx = torch.tensor(req_rows, dtype=torch.long, device=device)
+            parent_idx = torch.tensor(parent_slots, dtype=torch.long, device=device)
+            node_idx = torch.tensor(node_slots, dtype=torch.long, device=device)
+
+            parent_state_indices = spec_state_indices_tensor[req_idx, parent_idx]
+            parent_state_indices = torch.where(
+                parent_idx == 0,
+                parent_zero_state_indices[req_idx],
+                parent_state_indices,
+            )
+            node_state_indices = spec_state_indices_tensor[req_idx, node_idx]
+            conv_state_indices = torch.stack(
+                (parent_state_indices, node_state_indices), dim=1
+            ).to(torch.int32)
+            zero_idx = torch.zeros(
+                conv_state_indices.shape[0],
+                dtype=torch.int32,
+                device=device,
+            )
+            one_idx = torch.ones_like(zero_idx)
+
+            mixed_qkv_depth = mixed_qkv_spec.index_select(0, token_idx)
+            mixed_qkv_depth = causal_conv1d_update(
+                mixed_qkv_depth,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=conv_state_indices,
+                block_idx_last_scheduled_token=one_idx,
+                initial_state_idx=zero_idx,
+                validate_data=False,
+            )
+            query_depth, key_depth, value_depth = self.rearrange_mixed_qkv(
+                mixed_qkv_depth
+            )
+            g_depth, beta_depth = fused_gdn_gating(
+                self.A_log,
+                a_spec.index_select(0, token_idx),
+                b_spec.index_select(0, token_idx),
+                self.dt_bias,
+            )
+            cu_seqlens = torch.arange(
+                conv_state_indices.shape[0] + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            core_depth, final_state = fused_recurrent_gated_delta_rule(
+                q=query_depth,
+                k=key_depth,
+                v=value_depth,
+                g=g_depth,
+                beta=beta_depth,
+                initial_state=ssm_state,
+                inplace_final_state=False,
+                cu_seqlens=cu_seqlens,
+                ssm_state_indices=parent_state_indices.to(torch.int32),
+                use_qk_l2norm_in_kernel=True,
+            )
+            ssm_state.index_copy_(
+                0,
+                node_state_indices.to(torch.long),
+                final_state.to(ssm_state.dtype),
+            )
+            core_attn_out_spec.index_copy_(1, token_idx, core_depth)
+
+        _sm70_gdn_prefill_profile_end(
+            layer_name,
+            "ddtree_pure_spec_replay",
+            profile_start,
+            tokens=total_spec_tokens,
+            details=(
+                f"prefix_rows={len(prefix_rows)} "
+                f"depths={sum(1 for batch in depth_batches if batch)} "
+                f"tree_tokens={int(ddtree_num_tree_tokens_cpu.sum().item())}"
+            ),
+        )
+        return core_attn_out_spec
+
     def _can_use_flashqla_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -3861,6 +4245,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             num_non_spec_tokens = attn_metadata.num_decodes
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        spec_state_slot_selectors = (
+            attn_metadata.spec_state_slot_selectors
+            if attn_metadata.spec_state_slot_selectors is not None
+            else num_accepted_tokens
+        )
+        ddtree_parent_ids = attn_metadata.ddtree_parent_ids
+        ddtree_num_tree_tokens_cpu = attn_metadata.ddtree_num_tree_tokens_cpu
+        ddtree_requires_branch = _ddtree_parent_ids_require_branch(
+            ddtree_parent_ids,
+            ddtree_num_tree_tokens_cpu,
+            attn_metadata.num_spec_decodes,
+        )
+        ddtree_tree_gdn_pure_spec = (
+            ddtree_requires_branch
+            and spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+        )
+        if ddtree_requires_branch and not ddtree_tree_gdn_pure_spec:
+            raise RuntimeError(
+                "DDTree branched Qwen GDN state replay currently supports only "
+                "pure speculative verifier batches."
+            )
         layer_name = _encode_layer_name(self.prefix)
 
         mixed_qkv = mixed_qkv[:num_non_spec_tokens]
@@ -3906,7 +4313,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -3918,7 +4325,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
                     : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 ],
-                num_accepted_tokens=num_accepted_tokens,
+                num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
@@ -4229,27 +4636,59 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 assert spec_token_indx is not None
                 a_spec = a.index_select(0, spec_token_indx)
                 b_spec = b.index_select(0, spec_token_indx)
-            g_spec, beta_spec = fused_gdn_gating(
-                self.A_log, a_spec, b_spec, self.dt_bias
-            )
-            core_attn_out_spec, last_recurrent_state = (
-                fused_recurrent_gated_delta_rule(
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    g=g_spec,
-                    beta=beta_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_spec_decodes
-                        + 1  # type: ignore[attr-defined]
+            if ddtree_tree_gdn_pure_spec:
+                assert mixed_qkv_spec is not None
+                assert spec_query_start_loc is not None
+                assert spec_state_indices_tensor is not None
+                assert ddtree_parent_ids is not None
+                assert ddtree_num_tree_tokens_cpu is not None
+                core_attn_out_spec = self._forward_ddtree_gdn_pure_spec(
+                    mixed_qkv_spec=mixed_qkv_spec,
+                    a_spec=a_spec,
+                    b_spec=b_spec,
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    conv_weights=conv_weights,
+                    spec_query_start_loc=spec_query_start_loc[
+                        : attn_metadata.num_spec_decodes + 1
                     ],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
+                    spec_state_indices_tensor=spec_state_indices_tensor[
+                        : attn_metadata.num_spec_decodes
+                    ],
+                    spec_state_slot_selectors=spec_state_slot_selectors[
+                        : attn_metadata.num_spec_decodes
+                    ],
+                    ddtree_parent_ids=ddtree_parent_ids[
+                        : attn_metadata.num_spec_decodes
+                    ],
+                    ddtree_num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu[
+                        : attn_metadata.num_spec_decodes
+                    ],
+                    num_spec_decodes=attn_metadata.num_spec_decodes,
                 )
-            )
+                last_recurrent_state = ssm_state
+            else:
+                g_spec, beta_spec = fused_gdn_gating(
+                    self.A_log, a_spec, b_spec, self.dt_bias
+                )
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[  # type: ignore[index]
+                            : attn_metadata.num_spec_decodes
+                            + 1  # type: ignore[attr-defined]
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=spec_state_slot_selectors,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
@@ -4898,6 +5337,7 @@ def qwen_gdn_attention_core_standard_spec(
     non_spec_token_indx: torch.Tensor,
     spec_sequence_masks: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    spec_state_slot_selectors: torch.Tensor,
     layer_name: LayerNameType,
 ) -> None:
     layer_name = _resolve_layer_name(layer_name)
@@ -4928,6 +5368,7 @@ def qwen_gdn_attention_core_standard_spec(
         non_spec_token_indx=non_spec_token_indx,
         spec_sequence_masks=spec_sequence_masks,
         num_accepted_tokens=num_accepted_tokens,
+        spec_state_slot_selectors=spec_state_slot_selectors,
     )
     mixed_qkv_decode_requested = (
         self.enable_sm70_fused_sigmoid_mixed_qkv
@@ -4978,6 +5419,9 @@ def qwen_gdn_attention_core_standard_spec(
     _patch_metadata("non_spec_token_indx", non_spec_token_indx)
     _patch_metadata("spec_sequence_masks", spec_sequence_masks)
     _patch_metadata("num_accepted_tokens", num_accepted_tokens)
+    if spec_state_slot_selectors.numel() == 0:
+        spec_state_slot_selectors = num_accepted_tokens
+    _patch_metadata("spec_state_slot_selectors", spec_state_slot_selectors)
     try:
         self._forward_core(
             mixed_qkv=mixed_qkv,
@@ -5010,6 +5454,7 @@ def qwen_gdn_attention_core_spec_commit(
     non_spec_token_indx: torch.Tensor,
     spec_sequence_masks: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    spec_state_slot_selectors: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Experimental active-MTP Qwen GDN core with explicit spec metadata.
@@ -5105,6 +5550,7 @@ def qwen_gdn_attention_core_spec_commit(
                 non_spec_token_indx,
                 spec_sequence_masks,
                 num_accepted_tokens,
+                spec_state_slot_selectors,
             ) = metadata_tensors
             missing_core_spec_tensors = False
             missing_mixed_spec_tensors = False
@@ -5155,7 +5601,22 @@ def qwen_gdn_attention_core_spec_commit(
         non_spec_token_indx=non_spec_token_indx,
         spec_sequence_masks=spec_sequence_masks,
         num_accepted_tokens=num_accepted_tokens,
+        spec_state_slot_selectors=spec_state_slot_selectors,
     )
+    if spec_state_slot_selectors.numel() == 0:
+        spec_state_slot_selectors = num_accepted_tokens
+    ddtree_parent_ids = attn_metadata.ddtree_parent_ids
+    ddtree_num_tree_tokens_cpu = attn_metadata.ddtree_num_tree_tokens_cpu
+    ddtree_requires_branch = _ddtree_parent_ids_require_branch(
+        ddtree_parent_ids,
+        ddtree_num_tree_tokens_cpu,
+        attn_metadata.num_spec_decodes,
+    )
+    if ddtree_requires_branch and not pure_spec_decode:
+        raise RuntimeError(
+            "DDTree branched Qwen GDN state replay currently supports only "
+            "pure speculative verifier batches."
+        )
 
     if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
         conv_state = (
@@ -5168,6 +5629,38 @@ def qwen_gdn_attention_core_spec_commit(
             self.conv1d.weight.size(0),
             self.conv1d.weight.size(2),
         )
+        if ddtree_requires_branch:
+            assert ddtree_parent_ids is not None
+            assert ddtree_num_tree_tokens_cpu is not None
+            core_attn_out_spec = self._forward_ddtree_gdn_pure_spec(
+                mixed_qkv_spec=mixed_qkv,
+                a_spec=a,
+                b_spec=b,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                conv_weights=conv_weights,
+                spec_query_start_loc=spec_query_start_loc[
+                    : attn_metadata.num_spec_decodes + 1
+                ],
+                spec_state_indices_tensor=spec_state_indices_tensor[
+                    : attn_metadata.num_spec_decodes
+                ],
+                spec_state_slot_selectors=spec_state_slot_selectors[
+                    : attn_metadata.num_spec_decodes
+                ],
+                ddtree_parent_ids=ddtree_parent_ids[
+                    : attn_metadata.num_spec_decodes
+                ],
+                ddtree_num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu[
+                    : attn_metadata.num_spec_decodes
+                ],
+                num_spec_decodes=attn_metadata.num_spec_decodes,
+            )
+            core_attn_out[: mixed_qkv.shape[0]] = core_attn_out_spec.squeeze(0)
+            _sm70_dump_gdn_core_tensor(
+                "core_out", layer_name, core_attn_out, metadata_source
+            )
+            return core_attn_out
         mixed_qkv_spec = causal_conv1d_update(
             mixed_qkv,
             conv_state,
@@ -5175,7 +5668,7 @@ def qwen_gdn_attention_core_spec_commit(
             self.conv1d.bias,
             self.activation,
             conv_state_indices=spec_state_indices_tensor[:, 0],
-            num_accepted_tokens=num_accepted_tokens,
+            num_accepted_tokens=spec_state_slot_selectors,
             query_start_loc=spec_query_start_loc,
             max_query_len=spec_state_indices_tensor.size(-1),
             validate_data=False,
@@ -5197,7 +5690,7 @@ def qwen_gdn_attention_core_spec_commit(
             inplace_final_state=True,
             cu_seqlens=spec_query_start_loc,
             ssm_state_indices=spec_state_indices_tensor,
-            num_accepted_tokens=num_accepted_tokens,
+            num_accepted_tokens=spec_state_slot_selectors,
             use_qk_l2norm_in_kernel=True,
         )
         core_attn_out[: mixed_qkv.shape[0]] = core_attn_out_spec.squeeze(0)
@@ -5224,6 +5717,7 @@ def qwen_gdn_attention_core_spec_commit(
     _patch_metadata("non_spec_token_indx", non_spec_token_indx)
     _patch_metadata("spec_sequence_masks", spec_sequence_masks)
     _patch_metadata("num_accepted_tokens", num_accepted_tokens)
+    _patch_metadata("spec_state_slot_selectors", spec_state_slot_selectors)
     if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
         # The tensor rows are the graph-visible contract for FULL graph replay.
         # They include PAD_SLOT_ID rows with zero-length query ranges, so the
@@ -5462,6 +5956,7 @@ def qwen_gdn_attention_core_spec_commit_fake(
     non_spec_token_indx: torch.Tensor,
     spec_sequence_masks: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    spec_state_slot_selectors: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile."""
@@ -5498,6 +5993,7 @@ def gdn_attention_core_standard_spec_fake(
     non_spec_token_indx: torch.Tensor,
     spec_sequence_masks: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    spec_state_slot_selectors: torch.Tensor,
     layer_name: LayerNameType,
 ) -> None:
     """Fake implementation for torch.compile."""

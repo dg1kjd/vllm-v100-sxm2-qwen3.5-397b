@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
@@ -24,6 +25,7 @@ else:
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
+    DDTreeDraftPayload = object
     Request = object
 
 
@@ -228,6 +230,10 @@ class SchedulerOutput:
 
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
+
+    # req_id -> DDTree payload for the scheduled speculative tokens.
+    # Present only for dflash_ddtree tree-verifier experiments.
+    scheduled_ddtree_payloads: dict[str, DDTreeDraftPayload] | None = None
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None

@@ -619,6 +619,15 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED",
         True,
     )
+    decode_use_xqa = _env_bool("VLLM_FLASH_V100_DECODE_USE_XQA", True)
+    decode_dynamic_partitions = _env_bool(
+        "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
+        True,
+    )
+    decode_xqa_q4_min_seq_len = _env_int(
+        "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN",
+        32768,
+    )
     if selector_enabled:
         expected_sm70_priority = [
             "FLASH_ATTN_V100",
@@ -660,6 +669,24 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED"
         ),
         "decode_scalar_paged_effective": decode_scalar_paged,
+        "VLLM_FLASH_V100_DECODE_USE_XQA": os.environ.get(
+            "VLLM_FLASH_V100_DECODE_USE_XQA"
+        ),
+        "decode_xqa_effective": decode_use_xqa,
+        "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS": os.environ.get(
+            "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS"
+        ),
+        "decode_dynamic_partitions_effective": decode_dynamic_partitions,
+        "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": os.environ.get(
+            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE"
+        ),
+        "decode_partition_size_override": os.environ.get(
+            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE"
+        ),
+        "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": os.environ.get(
+            "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN"
+        ),
+        "decode_xqa_q4_min_seq_len_effective": decode_xqa_q4_min_seq_len,
         "full_flash_default_policy": full_flash_default_policy,
         "kv_cache_dtype": kv_cache_dtype_str,
         "fp8_kv_cache_requested_effective": fp8_kv_cache_requested,
@@ -683,7 +710,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
     dense_capture = _env_bool("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", False)
     flash_no_compile = _env_bool(
         "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE",
-        True,
+        False,
     )
     flash_0dot3_compile = _env_bool(
         "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
@@ -1675,7 +1702,15 @@ def main() -> int:
         )
 
     if args.cuda_profile_repeat:
-        torch.cuda.cudart().cudaProfilerStart()
+        try:
+            llm.start_profile()
+        except Exception as exc:
+            raise RuntimeError(
+                "--cuda-profile-repeat requires a worker profiler for "
+                "multiprocess TP runs. Pass "
+                "--engine-arg 'profiler_config={\"profiler\":\"cuda\"}' "
+                "so Nsight Compute/Systems capture the TP worker kernels."
+            ) from exc
     try:
         for case, result in zip(cases, case_results):
             repeats = [
@@ -1686,7 +1721,7 @@ def main() -> int:
             result["summary"] = _summarize(repeats)
     finally:
         if args.cuda_profile_repeat:
-            torch.cuda.cudart().cudaProfilerStop()
+            llm.stop_profile()
 
     first_case = case_results[0]
 

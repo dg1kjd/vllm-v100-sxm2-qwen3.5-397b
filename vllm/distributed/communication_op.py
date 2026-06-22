@@ -21,6 +21,27 @@ def tensor_model_parallel_all_reduce_sum2(
     return get_tp_group().all_reduce_sum2(input_a, input_b)
 
 
+def tensor_model_parallel_sm70_awq_mlp_down_tile_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """Try the SM70 AWQ MLP down-proj tile-runtime all-reduce lane."""
+    return get_tp_group().sm70_awq_mlp_down_tile_all_reduce(input_)
+
+
+def tensor_model_parallel_sm70_awq_mlp_down_tile_gemm_reduce(
+    input_: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+) -> torch.Tensor:
+    """Run the SM70 AWQ down-proj GEMM with tile-ready TP2 reduction."""
+    return get_tp_group().sm70_awq_mlp_down_tile_gemm_reduce(
+        input_, qweight, scales, group_size, k_ld, q_ld
+    )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

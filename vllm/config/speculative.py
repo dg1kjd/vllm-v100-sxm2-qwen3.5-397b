@@ -52,7 +52,7 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash"]
+DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -150,6 +150,18 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    # DFlash DDTree experimental configuration.
+    ddtree_budget: int | None = Field(default=None, ge=1)
+    """Maximum number of non-root DDTree verifier nodes. Defaults to
+    num_speculative_tokens for method='dflash_ddtree'."""
+    ddtree_top_k: int = Field(default=8, ge=1)
+    """Per-depth DFlash candidate count used to build DDTree branches."""
+    ddtree_chain_seed: bool = True
+    """Seed the DDTree with the top-1 chain before best-first branch expansion."""
+    ddtree_disable_tree_verify: bool = True
+    """Keep method='dflash_ddtree' on the flat DFlash path until tree verifier
+    correctness and Qwen GDN state commit are proven."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -279,8 +291,7 @@ class SpeculativeConfig:
         uses_aux_hidden_states = self.method in (
             "eagle3",
             "extract_hidden_states",
-            "dflash",
-        )
+        ) or self.use_dflash()
         factors.append(uses_aux_hidden_states)
 
         # The specific layers used also affect the computation graph
@@ -293,6 +304,16 @@ class SpeculativeConfig:
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
+
+        if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
+            factors.append(
+                (
+                    "dflash_ddtree",
+                    self.ddtree_budget,
+                    self.ddtree_top_k,
+                    self.ddtree_chain_seed,
+                )
+            )
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -694,7 +715,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3") or self.use_dflash():
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -732,7 +753,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3") or self.use_dflash():
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -744,15 +765,16 @@ class SpeculativeConfig:
                     ):
                         pass
                     else:
+                        eagle_method = "dflash" if self.use_dflash() else self.method
                         eagle_config = EAGLEConfig(
                             self.draft_model_config.hf_config,
-                            method=self.method,
+                            method=eagle_method,
                             model_type="eagle",
                         )
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.use_dflash():
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -784,6 +806,9 @@ class SpeculativeConfig:
                         "A speculative model was provided, but "
                         "`num_speculative_tokens` was not provided"
                     )
+
+                if self.use_dflash_ddtree() and self.ddtree_budget is None:
+                    self.ddtree_budget = self.num_speculative_tokens
 
                 self.draft_tensor_parallel_size = (
                     SpeculativeConfig._verify_and_get_draft_tp(
@@ -992,6 +1017,17 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+        if self.use_dflash_ddtree():
+            if self.ddtree_budget is None:
+                self.ddtree_budget = self.num_speculative_tokens
+            if (
+                not self.ddtree_disable_tree_verify
+                and self.ddtree_budget < self.num_speculative_tokens
+            ):
+                raise ValueError(
+                    "ddtree_budget must be >= num_speculative_tokens when "
+                    "dflash_ddtree tree verification is enabled."
+                )
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
@@ -1068,10 +1104,19 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        return self.method in ("eagle", "eagle3", "mtp") or self.use_dflash()
 
     def use_dflash(self) -> bool:
-        return self.method == "dflash"
+        return self.method in get_args(DFlashModelTypes)
+
+    def use_dflash_ddtree(self) -> bool:
+        return self.method == "dflash_ddtree"
+
+    def num_speculative_state_tokens(self) -> int:
+        num_spec_tokens = self.num_speculative_tokens or 0
+        if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
+            return max(num_spec_tokens, self.ddtree_budget or num_spec_tokens)
+        return num_spec_tokens
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

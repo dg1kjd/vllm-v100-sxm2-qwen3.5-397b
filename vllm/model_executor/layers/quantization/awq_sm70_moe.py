@@ -719,6 +719,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._awq_moe_buf_topk_ids = torch.empty(
             persistent_tokens, top_k, dtype=torch.int32, device=device
         )
+        layer._awq_moe_buf_sorted_weights = torch.empty(
+            persistent_tokens, top_k, dtype=torch.float32, device=device
+        )
         layer._awq_moe_buf_token_expert_indices = torch.arange(
             max_slots, dtype=torch.int32, device=device
         ).view(persistent_tokens, top_k)
@@ -804,6 +807,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 "expert_offsets64": layer._awq_moe_buf_expert_offsets64,
                 "inv_permuted_idx": layer._awq_moe_buf_inv_permuted_idx[:num_tokens],
                 "topk_ids": layer._awq_moe_buf_topk_ids[:num_tokens],
+                "sorted_weights": layer._awq_moe_buf_sorted_weights[:num_tokens],
                 "token_expert_indices": layer._awq_moe_buf_token_expert_indices[
                     :num_tokens
                 ],
@@ -914,6 +918,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             "topk_ids": torch.empty(
                 num_tokens, top_k, dtype=torch.int32, device=device
             ),
+            "sorted_weights": torch.empty(
+                num_tokens, top_k, dtype=torch.float32, device=device
+            ),
             "token_expert_indices": torch.arange(
                 total_slots, dtype=torch.int32, device=device
             ).view(num_tokens, top_k),
@@ -982,6 +989,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             buffers["permuted_input"],
             buffers["intermediate"],
             buffers["sorted_output"],
+            buffers["sorted_weights"].view(-1),
             buffers["legacy_w13_ptrs_w"],
             buffers["legacy_w13_ptrs_s"],
             buffers["legacy_w2_ptrs_w"],

@@ -184,8 +184,12 @@ public:
         const bool silu_act = ((int)operation.epilogue & (int)Epilogue::kGatedSilu);
         const bool moe_weighted_reduce =
             ((int)operation.epilogue & (int)Epilogue::kMoeWeightedReduce);
+        const bool tile_allreduce =
+            ((int)operation.epilogue & (int)Epilogue::kTileAllReduce);
         const auto* moe_reduce =
             static_cast<const MoeWeightedReduceParam*>(operation.reserved);
+        const auto* tile_reduce =
+            static_cast<const TileAllReduceParam*>(operation.tile_allreduce);
 
         MatrixLayout Pdesc = Ddesc;
         Pdesc.ld           = mk2cs<Gemm::kOrderC>(Pdesc.rows, Pdesc.cols).x;
@@ -200,7 +204,9 @@ public:
                                moe_weighted_reduce,
                                moe_reduce ? moe_reduce->out : nullptr,
                                moe_reduce ? moe_reduce->sorted_weights : nullptr,
-                               moe_reduce ? moe_reduce->offsets : nullptr};
+                               moe_reduce ? moe_reduce->offsets : nullptr,
+                               tile_allreduce,
+                               tile_reduce ? *tile_reduce : TileAllReduceParam{}};
 
         // std::cout << Adesc.offsets << " " << Adesc.idxs << "\n";
 
@@ -211,8 +217,22 @@ public:
             to_param((void*)V, Vdesc),
         };
 
-        const auto grid  = sched.get_grid_shape();
+        auto       grid  = sched.get_grid_shape();
         const auto block = Gemm::Impl::WARPS * WARP_SIZE;
+
+        if (epilogue.tile_allreduce && epilogue.tile_allreduce_param.kernel_reducer_blocks > 0) {
+            auto& tile_ar = epilogue.tile_allreduce_param;
+            tile_ar.producer_grid_x = static_cast<int>(grid.x);
+            tile_ar.producer_grid_y = static_cast<int>(grid.y);
+            tile_ar.producer_grid_z = static_cast<int>(grid.z);
+            if (tile_ar.world_size == 2 && tile_ar.rank_data != nullptr && tile_ar.output != nullptr &&
+                tile_ar.output_numel > 0 && tile_ar.tile_numel > 0 && grid.z < 65535) {
+                grid.z += 1;
+            }
+            else {
+                tile_ar.kernel_reducer_blocks = 0;
+            }
+        }
 
         // std::cout << info_.name << " " << splits << " " << swizzle << " " << sched.tiles_[0] << " " <<
         // sched.tiles_[1]

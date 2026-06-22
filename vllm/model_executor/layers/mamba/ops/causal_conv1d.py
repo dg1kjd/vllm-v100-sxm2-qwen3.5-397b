@@ -1237,3 +1237,249 @@ def causal_conv1d_update(
     if unsqueeze:
         out = out.squeeze(-1)
     return out.to(original_x_dtype)
+
+
+@triton.jit()
+def _causal_conv1d_update_ddtree_kernel(
+    x_ptr,  # (num_tokens, dim)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,  # (num_cache_lines, dim, width - 1)
+    conv_state_indices_ptr,  # (batch, max_query_len)
+    parent_ids_ptr,  # (batch, max_query_len)
+    num_accepted_tokens_ptr,  # (batch,)
+    query_start_loc_ptr,  # (batch + 1)
+    o_ptr,  # (num_tokens, dim)
+    batch: int,
+    dim: tl.constexpr,
+    seqlen: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_token: tl.int64,
+    stride_x_dim: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_state_indices_seq: tl.constexpr,
+    stride_state_indices_tok: tl.constexpr,
+    stride_parent_ids_seq: tl.constexpr,
+    stride_parent_ids_tok: tl.constexpr,
+    stride_o_token: tl.int64,
+    stride_o_dim: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    idx_seq = tl.program_id(0)
+    if idx_seq >= batch:
+        return
+
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_feats = idx_feats < dim
+
+    query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    query_end_index = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64)
+    actual_seqlen = query_end_index - query_start_index
+
+    selected_slot = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1
+    selected_slot = tl.minimum(tl.maximum(selected_slot, 0), seqlen - 1)
+
+    for idx_token in tl.range(seqlen):
+        active = idx_token < actual_seqlen
+        dst_state_idx = tl.load(
+            conv_state_indices_ptr
+            + idx_seq * stride_state_indices_seq
+            + idx_token * stride_state_indices_tok
+        ).to(tl.int64)
+
+        if USE_PAD_SLOT:
+            active = active & (dst_state_idx != pad_slot_id)
+
+        parent_slot = tl.load(
+            parent_ids_ptr
+            + idx_seq * stride_parent_ids_seq
+            + idx_token * stride_parent_ids_tok
+        ).to(tl.int64)
+        parent_slot = tl.where(parent_slot < 0, 0, parent_slot)
+        src_slot = tl.where(idx_token == 0, selected_slot, parent_slot)
+        src_slot = tl.minimum(tl.maximum(src_slot, 0), seqlen - 1)
+        src_state_idx = tl.load(
+            conv_state_indices_ptr
+            + idx_seq * stride_state_indices_seq
+            + src_slot * stride_state_indices_tok
+        ).to(tl.int64)
+
+        if USE_PAD_SLOT:
+            active = active & (src_state_idx != pad_slot_id)
+        active = active & (src_state_idx < num_cache_lines)
+        active = active & (dst_state_idx < num_cache_lines)
+
+        x_row = query_start_index + idx_token
+        x_base = x_ptr + x_row * stride_x_token + idx_feats * stride_x_dim
+        raw = tl.load(x_base, mask=mask_feats & active, other=0.0)
+
+        if HAS_BIAS:
+            acc = tl.load(bias_ptr + idx_feats, mask=mask_feats, other=0.0).to(
+                tl.float32
+            )
+        else:
+            acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for j in tl.static_range(0, KERNEL_WIDTH):
+            w_j = tl.load(
+                w_ptr + idx_feats * stride_w_dim + j * stride_w_width,
+                mask=mask_feats,
+                other=0.0,
+            ).to(tl.float32)
+            if j == KERNEL_WIDTH - 1:
+                x_j = raw.to(tl.float32)
+            else:
+                x_j = tl.load(
+                    conv_state_ptr
+                    + src_state_idx * stride_conv_state_seq
+                    + idx_feats * stride_conv_state_dim
+                    + j * stride_conv_state_tok,
+                    mask=mask_feats & active,
+                    other=0.0,
+                ).to(tl.float32)
+            acc += x_j * w_j
+
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+
+        tl.store(
+            o_ptr + x_row * stride_o_token + idx_feats * stride_o_dim,
+            acc,
+            mask=mask_feats & active,
+        )
+
+        for j in tl.static_range(0, KERNEL_WIDTH - 1):
+            if j == KERNEL_WIDTH - 2:
+                new_state = raw
+            else:
+                new_state = tl.load(
+                    conv_state_ptr
+                    + src_state_idx * stride_conv_state_seq
+                    + idx_feats * stride_conv_state_dim
+                    + (j + 1) * stride_conv_state_tok,
+                    mask=mask_feats & active,
+                    other=0.0,
+                )
+            tl.store(
+                conv_state_ptr
+                + dst_state_idx * stride_conv_state_seq
+                + idx_feats * stride_conv_state_dim
+                + j * stride_conv_state_tok,
+                new_state,
+                mask=mask_feats & active,
+            )
+
+
+def causal_conv1d_update_ddtree(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    parent_ids: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+):
+    """Tree-parent-aware causal conv update for DDTree verifier rows.
+
+    Row 0 is the verifier prefix row and reads from the selected accepted
+    state slot. Rows 1..N are DDTree nodes and read from their parent slot.
+    """
+
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+    assert conv_state_indices is not None
+    assert parent_ids is not None
+    assert num_accepted_tokens is not None
+    assert query_start_loc is not None
+    assert x.dim() == 2
+    assert conv_state_indices.dim() == 2
+    assert parent_ids.dim() == 2
+
+    if (
+        parent_ids.device != x.device
+        or parent_ids.dtype != torch.int32
+        or num_accepted_tokens.device != x.device
+        or num_accepted_tokens.dtype != torch.int32
+    ):
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "DDTree conv parent ids and selectors must already be CUDA "
+                "int32 during graph capture."
+            )
+        parent_ids = parent_ids.to(device=x.device, dtype=torch.int32)
+        num_accepted_tokens = num_accepted_tokens.to(device=x.device, dtype=torch.int32)
+
+    original_x_dtype = x.dtype
+    x = x.to(conv_state.dtype)
+    out = torch.empty_like(x)
+
+    batch = conv_state_indices.size(0)
+    dim = x.size(1)
+    seqlen = conv_state_indices.size(1)
+    _, width = weight.shape
+    num_cache_lines, _, state_len = conv_state.size()
+    assert state_len >= width - 1
+
+    stride_x_token, stride_x_dim = x.stride()
+    stride_o_token, stride_o_dim = out.stride()
+    stride_w_dim, stride_w_width = weight.stride()
+    (
+        stride_conv_state_seq,
+        stride_conv_state_dim,
+        stride_conv_state_tok,
+    ) = conv_state.stride()
+    stride_state_indices_seq, stride_state_indices_tok = conv_state_indices.stride()
+    stride_parent_ids_seq, stride_parent_ids_tok = parent_ids.stride()
+
+    def grid(META):
+        return (batch, triton.cdiv(dim, META["BLOCK_N"]))
+
+    _causal_conv1d_update_ddtree_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+        parent_ids,
+        num_accepted_tokens,
+        query_start_loc,
+        out,
+        batch,
+        dim,
+        seqlen,
+        num_cache_lines,
+        stride_x_token,
+        stride_x_dim,
+        stride_w_dim,
+        stride_w_width,
+        stride_conv_state_seq,
+        stride_conv_state_dim,
+        stride_conv_state_tok,
+        stride_state_indices_seq,
+        stride_state_indices_tok,
+        stride_parent_ids_seq,
+        stride_parent_ids_tok,
+        stride_o_token,
+        stride_o_dim,
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        USE_PAD_SLOT=pad_slot_id is not None,
+        BLOCK_N=256,
+    )
+    return out.to(original_x_dtype)

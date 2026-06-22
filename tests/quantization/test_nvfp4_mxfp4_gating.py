@@ -4,11 +4,16 @@
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import envs
 import vllm.model_executor.kernels.linear.nvfp4.emulation as nvfp4_emulation
 from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
     EmulationNvFp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+    FlashInferCudnnNvFp4LinearKernel,
+    FlashInferTrtllmNvFp4LinearKernel,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w4a4_mxfp4 as mxfp4_scheme,
@@ -21,14 +26,47 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 
+def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
+
+    assert envs.use_sm70_turbomind(True)
+    assert not envs.use_sm70_turbomind(False)
+
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
+    assert envs.use_sm70_turbomind(False)
+
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
+    assert not envs.use_sm70_turbomind(True)
+
+
 def test_nvfp4_min_capability_honors_linear_backend_emulation(monkeypatch):
     monkeypatch.delenv("VLLM_USE_NVFP4_CT_EMULATIONS", raising=False)
     monkeypatch.delenv("VLLM_NVFP4_GEMM_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
 
     with set_current_vllm_config(
         VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
     ):
+        assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_TURBOMIND", "0")
+    with set_current_vllm_config(
+        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
+    ):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 75
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_TURBOMIND", raising=False)
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
+    with set_current_vllm_config(
+        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
+    ):
+        assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
+
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
+    with set_current_vllm_config(
+        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
+    ):
+        assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
     with set_current_vllm_config(
         VllmConfig(kernel_config=KernelConfig(linear_backend="emulation"))
@@ -43,6 +81,18 @@ def test_nvfp4_min_capability_honors_legacy_emulation_env(monkeypatch):
         VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
     ):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
+
+
+def test_flashinfer_nvfp4_backends_reject_sm70():
+    trtllm_supported, trtllm_reason = (
+        FlashInferTrtllmNvFp4LinearKernel.is_supported(70)
+    )
+    cudnn_supported, cudnn_reason = FlashInferCudnnNvFp4LinearKernel.is_supported(70)
+
+    assert not trtllm_supported
+    assert "sm_100" in trtllm_reason
+    assert not cudnn_supported
+    assert "sm_100" in cudnn_reason
 
 
 def _make_mxfp4_layer() -> torch.nn.Module:

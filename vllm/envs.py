@@ -108,6 +108,10 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS: bool = False
+    VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
+    VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
+    VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind"] = "auto"
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
@@ -129,6 +133,19 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TUNE_SMALL_SHAPES: bool = False
     VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
+    VLLM_SM70_AWQ_TP2_FAST_SELECTOR: bool = True
+    VLLM_SM70_AWQ_MLP_ENGINE: bool = False
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE: Literal["inline", "engine"] = "inline"
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL: int = 5120
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS: int = 1
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS: int = 1
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS: int = 1
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP: bool = False
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM: bool = True
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL: int = 128
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS: int = 4
+    VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS: int = 0
     VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
@@ -158,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
+    VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
     VLLM_SM70_F16_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_MOE_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_F16_DENSE_MAX_M: int = 64
@@ -170,8 +188,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DEQUANT_FALLBACK: bool = True
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
-    VLLM_SM70_NVFP4_TURBOMIND: bool = False
-    VLLM_SM70_MXFP4_TURBOMIND: bool = False
+    VLLM_SM70_NVFP4_TURBOMIND: bool = True
+    VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -211,13 +229,17 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0: bool = True
     VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING: bool = True
     VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX: bool = False
+    VLLM_DFLASH_DDTREE_FUSED_GDN: bool = True
+    VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN: bool = True
+    VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT: bool = False
+    VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT: bool = True
     VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
     VLLM_FLASH_V100_DENSE_D256_LOW_SMEM: bool = False
     VLLM_FLASH_V100_DENSE_D256_WMMA_QK: bool = True
-    VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM: bool = False
+    VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM: bool = True
     VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32: bool = False
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE: bool = True
@@ -243,6 +265,9 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_BFLA_SPEC_PROB: float = 0.0
     VLLM_FLASH_V100_BFLA_SPEC_SEED: int = 1
     VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE: bool = False
+    VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG: bool = False
+    VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT: int = 12
+    VLLM_FLASH_V100_DFLASH_PREFIX_DUMP: bool = False
     VLLM_FLASH_V100_ENABLE_PAGED_PREFILL: str | None = None
     VLLM_FLASH_V100_DISABLE_PAGED_PREFILL: bool = False
     VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE: bool = False
@@ -250,12 +275,16 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK: bool = False
     VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q: int = 16
     VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN: int = 0
+    VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS: bool = True
     VLLM_FLASH_V100_DECODE_PARTITION_SIZE: str | None = None
     VLLM_FLASH_V100_DECODE_DENSE_REFERENCE: bool = False
     VLLM_FLASH_V100_DECODE_DENSE_CACHE: bool = False
     VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL: bool = False
     VLLM_FLASH_V100_DECODE_USE_BHMD_OUT: bool = True
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
+    VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
+    VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
+    VLLM_FLASH_V100_TRACE_DECODE_ACTIVE: bool = False
     VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED: bool = True
     VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR: str | None = None
     VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS: int = 0
@@ -293,6 +322,8 @@ if TYPE_CHECKING:
     VLLM_DFLASH_DUMP_FIRST_PASS: bool = False
     VLLM_DFLASH_DISABLE_AUX_OUTPUTS: bool = False
     VLLM_DFLASH_DEBUG_STATE_TABLE: bool = False
+    VLLM_DFLASH_DDTREE_DEBUG: bool = False
+    VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE: bool = False
     VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR: str | None = None
     VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ: int = 0
     VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ: int = 0
@@ -370,7 +401,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN: bool = True
     VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE: bool = False
-    VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE: bool = True
+    VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE: bool = False
     VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE: int = 1
     VLLM_SM70_FLA_RECURRENT_SCHEDULE: bool = True
     VLLM_SM70_FLA_BV: str | None = None
@@ -711,11 +742,12 @@ def get_sm70_quant_backend() -> SM70QuantBackend:
 
 
 def use_sm70_turbomind(default_enabled: bool) -> bool:
-    del default_enabled
     backend = get_sm70_quant_backend()
     if backend == "marlin":
         return False
-    return True
+    if backend == "turbomind":
+        return True
+    return bool(default_enabled)
 
 
 def force_sm70_marlin() -> bool:
@@ -1376,6 +1408,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
+    # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
+    # building EngineArgs and must be registered so environment validation does
+    # not warn users that our own documented knobs are unknown.
+    "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": lambda: bool(
+        int(os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS", "0"))
+    ),
+    "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS": lambda: bool(
+        int(os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS", "0"))
+    ),
+    # 1Cat SM70 public-profile opt-outs. These are consumed while building
+    # EngineArgs and must be registered so environment validation does not
+    # warn users that our own documented knobs are unknown.
+    "VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS": lambda: bool(
+        int(os.getenv("VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS", "0"))
+    ),
+    "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS": lambda: bool(
+        int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))
+    ),
     # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
     # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
@@ -1386,8 +1436,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_AWQ_TURBOMIND", "1"))
     ),
     # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
-    # weight-only formats. Default-off until route-hit, quality, and decode
-    # speed are validated per format.
+    # weight-only formats. These broad compressed-tensor gates stay default-off;
+    # individual accepted formats such as NVFP4/MXFP4 are gated below.
     "VLLM_SM70_GPTQ_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_GPTQ_TURBOMIND", "0"))
     ),
@@ -1456,6 +1506,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dependencies introduced by measured split/workspace topology.
     "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))
+    ),
+    "VLLM_SM70_AWQ_TP2_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR", "1"))
+    ),
+    # Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. The
+    # first stage fuses gate_up_proj + SiluAndMul through the TurboMind GEMM
+    # epilogue for M=1/TP2 while keeping the existing down_proj/reduce path.
+    "VLLM_SM70_AWQ_MLP_ENGINE": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))
+    ),
+    # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
+    # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
+    # hidden-state reduction. This is default-off until it wins end-to-end.
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR", "0"))
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE": lambda: os.getenv(
+        "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE", "inline"
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL", "5120")
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS", "1")
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS", "1")
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS", "1")
+    ),
+    # Experimental TileRT-style fused down-proj lane. TurboMind AWQ GEMM
+    # publishes per-N-tile readiness from its epilogue; a reducer worker waits
+    # on those flags and reduces TP2 peer staging into the final output.
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP", "0"))
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM", "1"))
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL", "128")
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS", "4")
+    ),
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS": lambda: int(
+        os.getenv(
+            "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS", "0"
+        )
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))
@@ -1575,6 +1675,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TP_ALLREDUCE_TRACE": lambda: bool(
         int(os.getenv("VLLM_TP_ALLREDUCE_TRACE", "0"))
     ),
+    "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT": lambda: (
+        int(os.environ["VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT"])
+        if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
+        else None
+    ),
     # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
     # off until the communicator path has same-criterion model evidence.
     "VLLM_SM70_TOP1_CUSTOM_AR": lambda: bool(
@@ -1625,11 +1730,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_DENSE_GATED_SILU": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_DENSE_GATED_SILU", "1"))
     ),
+    # Accepted SM70 FP4-family dense routes. Default-on keeps NVFP4/MXFP4
+    # checkpoints loadable and fast on V100; set either env to 0 to force the
+    # non-TurboMind route for diagnostics.
     "VLLM_SM70_NVFP4_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "1"))
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "0"))
+        int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
@@ -1809,7 +1917,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_FLASH_V100_DENSE_D256_WMMA_QK", "1"))
     ),
     "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "0"))
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1"))
     ),
     "VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK", "0"))
@@ -1886,6 +1994,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE", "0"))
     ),
+    "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0"))
+    ),
+    "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12")
+    ),
+    "VLLM_FLASH_V100_DFLASH_PREFIX_DUMP": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0"))
+    ),
     # FlashAttention V100 backend tuning/debug switches. These are registered
     # so exactness experiments are reproducible and do not trip unknown-env
     # checks. Decode defaults to scalar paged Flash-V100 after classified
@@ -1918,6 +2035,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
     ),
+    "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1"))
+    ),
     "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": lambda: os.getenv(
         "VLLM_FLASH_V100_DECODE_PARTITION_SIZE"
     ),
@@ -1935,6 +2055,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0"))
+    ),
+    "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
+    ),
+    "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")
+    ),
+    "VLLM_FLASH_V100_TRACE_DECODE_ACTIVE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0"))
     ),
     "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED", "1"))
@@ -2048,6 +2177,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DFLASH_DEBUG_STATE_TABLE": lambda: bool(
         int(os.getenv("VLLM_DFLASH_DEBUG_STATE_TABLE", "0"))
+    ),
+    "VLLM_DFLASH_DDTREE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0"))
+    ),
+    "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0"))
+    ),
+    "VLLM_DFLASH_DDTREE_FUSED_GDN": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1"))
+    ),
+    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1"))
+    ),
+    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0"))
+    ),
+    "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT", "1"))
     ),
     "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR": lambda: os.getenv(
         "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR"
@@ -2400,14 +2547,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ).strip().lower()
         in ("1", "true", "yes", "on")
     ),
-    # SM70 Flash-V100 production default: keep decode CUDA graphs while
-    # avoiding latest vLLM's heavy VLLM_COMPILE + piecewise graph startup path.
-    # Set VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=0 to opt back into the
-    # upstream compile path for diagnostics.
+    # SM70 Flash-V100 production default: use the recovered 0.0.3-style
+    # VLLM_COMPILE + FULL_AND_PIECEWISE graph path. Set
+    # VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1 to opt into the lighter
+    # diagnostic decode-only graph path.
     "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE": lambda: bool(
         os.getenv(
             "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE",
-            "1",
+            "0",
         ).strip().lower()
         in ("1", "true", "yes", "on")
     ),

@@ -213,6 +213,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_gemm_sm70_out", torch::kCUDA, &awq_gemm_sm70_out);
 
   ops.def(
+      "awq_gemm_sm70_out_tile_reduce(Tensor(a!) out, Tensor(b!) staging, "
+      "Tensor _in_feats, Tensor _kernel, Tensor _scaling_factors, "
+      "int group_size, int k_ld, int q_ld, int fa_ptr, int tile_numel, "
+      "int reducer_blocks, int kernel_reducer_blocks, bool overlap) -> ()");
+  ops.impl("awq_gemm_sm70_out_tile_reduce", torch::kCUDA,
+           &awq_gemm_sm70_out_tile_reduce);
+
+  ops.def(
       "fp8_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu) -> ()");
@@ -377,10 +385,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor src_w13_ptrs_w_rows, Tensor src_w13_ptrs_s_rows, "
       "Tensor src_w2_ptrs_w_rows, Tensor src_w2_ptrs_s_rows, "
       "Tensor(b!) compact_input, Tensor(c!) intermediate, "
-      "Tensor(d!) sorted_output, "
-      "Tensor(e!) dst_w13_ptrs_w_rows, Tensor(f!) dst_w13_ptrs_s_rows, "
-      "Tensor(g!) dst_w2_ptrs_w_rows, Tensor(h!) dst_w2_ptrs_s_rows, "
-      "Tensor(i!) expert_offsets, Tensor(j!) inv_permuted_idx, "
+      "Tensor(d!) sorted_output, Tensor(e!) sorted_weights, "
+      "Tensor(f!) dst_w13_ptrs_w_rows, Tensor(g!) dst_w13_ptrs_s_rows, "
+      "Tensor(h!) dst_w2_ptrs_w_rows, Tensor(i!) dst_w2_ptrs_s_rows, "
+      "Tensor(j!) expert_offsets, Tensor(k!) inv_permuted_idx, "
       "int w13_k, int w13_n, int w2_k, int w2_n, int group_size, "
       "int hidden_logical_size) -> ()");
   ops.impl("awq_moe_single_token_sm70_out", torch::kCUDA,
@@ -555,6 +563,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("top1_argmax", torch::kCUDA, &top1_argmax);
+  custom_ar.def(
+      "tile_runtime_all_reduce(int fa, Tensor inp, Tensor! out, int "
+      "reg_buffer, int reg_buffer_sz_bytes, int tile_numel, int "
+      "engine_blocks, int compute_iters) -> ()");
+  custom_ar.impl("tile_runtime_all_reduce", torch::kCUDA,
+                 &tile_runtime_all_reduce);
+  custom_ar.def(
+      "tile_runtime_all_reduce_engine(int fa, Tensor inp, Tensor! out, int "
+      "reg_buffer, int reg_buffer_sz_bytes, int tile_numel, int "
+      "producer_blocks, int reducer_blocks, int compute_iters) -> ()");
+  custom_ar.impl("tile_runtime_all_reduce_engine", torch::kCUDA,
+                 &tile_runtime_all_reduce_engine);
+  custom_ar.def(
+      "tile_runtime_wait_reduce(int fa, Tensor staging, Tensor! out, "
+      "int tile_numel, int reducer_blocks) -> ()");
+  custom_ar.impl("tile_runtime_wait_reduce", torch::kCUDA,
+                 &tile_runtime_wait_reduce);
 
   custom_ar.def("dispose", &dispose);
   custom_ar.def("meta_size", &meta_size);

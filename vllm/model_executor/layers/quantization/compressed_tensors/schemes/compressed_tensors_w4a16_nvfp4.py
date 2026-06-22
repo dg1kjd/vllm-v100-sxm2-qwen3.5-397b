@@ -93,12 +93,12 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind_or_marlin(
+        if sm70_tm.should_prepare_turbomind(
             layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
         ):
             logger.info_once(
                 "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path "
-                "enabled under W4A16 Marlin."
+                "enabled."
             )
             sm70_tm.prepare_nvfp4_linear(layer)
             layer.weight = Parameter(

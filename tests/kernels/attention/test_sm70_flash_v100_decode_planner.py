@@ -12,6 +12,15 @@ def _clear_decode_caches() -> None:
     flash_attn_v100._decode_workspace_cache.clear()
 
 
+def _sm70_device_or_skip() -> torch.device:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    for index in range(torch.cuda.device_count()):
+        if torch.cuda.get_device_capability(index) == (7, 0):
+            return torch.device(f"cuda:{index}")
+    pytest.skip("SM70/V100 CUDA device is required")
+
+
 def test_short_hd256_decode_default_partition_stays_256(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
 
@@ -42,6 +51,23 @@ def test_long_hd256_gqa_decode_default_partition_preserves_256(
     )
 
     assert partition == 256
+
+
+def test_32k_hd256_gqa_decode_default_partition_uses_1024(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+
+    partition = flash_attn_v100._get_decode_partition_size(
+        max_seq_capacity=65536,
+        head_dim=256,
+        num_q_heads=8,
+        num_kv_heads=1,
+        max_seq_len_hint=32769,
+        batch_size_hint=1,
+    )
+
+    assert partition == 1024
 
 
 def test_static_decode_plan_uses_fixed_launch_and_active_runtime(
@@ -134,3 +160,53 @@ def test_static_decode_cuda_graph_capture_runtime_active_keeps_short_plan(
     assert plan.actual_num_partitions == 17
     assert plan.launch_num_partitions == 32
     assert plan.workspace_num_partitions == 32
+
+
+@torch.inference_mode()
+def test_stale_active_num_partitions_does_not_truncate_decode(
+    monkeypatch,
+) -> None:
+    device = _sm70_device_or_skip()
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.setenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1")
+    _clear_decode_caches()
+
+    torch.manual_seed(0)
+    seq_len = 513
+    block_size = 16
+    num_blocks = (seq_len + block_size - 1) // block_size
+    q = torch.randn((1, 2, 64), dtype=torch.float16, device=device)
+    k_cache = torch.randn(
+        (num_blocks, block_size, 1, 64), dtype=torch.float16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+        1, num_blocks
+    )
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+
+    expected_active = torch.tensor([3], dtype=torch.int32, device=device)
+    stale_active = torch.tensor([1], dtype=torch.int32, device=device)
+    expected = flash_attn_v100.flash_attn_decode_paged(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        max_seq_len_hint=seq_len,
+        workspace_seq_capacity_hint=seq_len,
+        active_num_partitions=expected_active,
+    )
+    actual = flash_attn_v100.flash_attn_decode_paged(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        max_seq_len_hint=seq_len,
+        workspace_seq_capacity_hint=seq_len,
+        active_num_partitions=stale_active,
+    )
+
+    torch.cuda.synchronize(device)
+    assert torch.equal(actual, expected)

@@ -1122,6 +1122,7 @@ def _check_awq_moe(
             )
         elif actual_impl == "legacy_single_token_compact":
             topk_weights = _make_topk_weights(top_k, device)
+            sorted_weights = torch.empty(top_k, dtype=torch.float32, device=device)
             compact_input = torch.empty_like(sorted_input)
             intermediate_actual = torch.empty(
                 (total_slots, intermediate_size),
@@ -1138,6 +1139,7 @@ def _check_awq_moe(
                 dtype=torch.float16,
                 device=device,
             )
+            final_output_actual.zero_()
             ptr_row_bytes = int(w13_ptrs_w.numel() // num_experts)
             compact_ptrs_w13_w = torch.empty(
                 (top_k, ptr_row_bytes), dtype=torch.uint8, device=device
@@ -1157,6 +1159,7 @@ def _check_awq_moe(
                 compact_input,
                 intermediate_actual,
                 sorted_output_actual,
+                sorted_weights,
                 compact_ptrs_w13_w,
                 compact_ptrs_w13_s,
                 compact_ptrs_w2_w,
@@ -1389,7 +1392,7 @@ def _check_awq_moe(
                 layer=awq_moe_layer,
             )
         )
-    results.extend([
+    results.append(
         _with_moe_metadata(
             _stats(
                 f"{base}_fused_w13_silu_and_mul"
@@ -1407,22 +1410,25 @@ def _check_awq_moe(
             if actual_impl == "legacy_single_token_compact"
             else "silu_and_mul",
             layer=awq_moe_layer,
-        ),
-        _with_moe_metadata(
-            _stats(
-                f"{base}_w2_sorted_output",
-                sorted_output_actual,
-                sorted_output_expected,
-            ),
-            m=m,
-            top_k=top_k,
-            num_experts=num_experts,
-            actual_impl=actual_impl,
-            expert_pattern=expert_pattern,
-            stage="w2_sorted_output",
-            layer=awq_moe_layer,
-        ),
-    ])
+        )
+    )
+    if actual_impl != "legacy_single_token_compact":
+        results.append(
+            _with_moe_metadata(
+                _stats(
+                    f"{base}_w2_sorted_output",
+                    sorted_output_actual,
+                    sorted_output_expected,
+                ),
+                m=m,
+                top_k=top_k,
+                num_experts=num_experts,
+                actual_impl=actual_impl,
+                expert_pattern=expert_pattern,
+                stage="w2_sorted_output",
+                layer=awq_moe_layer,
+            )
+        )
     if final_output_actual is not None and final_output_expected is not None:
         results.append(
             _with_moe_metadata(

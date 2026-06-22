@@ -914,11 +914,22 @@ class VllmConfig:
         executor_backend = self.parallel_config.distributed_executor_backend
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
+        dflash_ddtree_tree_verify = (
+            self.speculative_config is not None
+            and self.speculative_config.use_dflash_ddtree()
+            and not self.speculative_config.ddtree_disable_tree_verify
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
             # decoding.
+            if dflash_ddtree_tree_verify:
+                raise ValueError(
+                    "Async scheduling is not compatible with dflash_ddtree "
+                    "tree verification. Disable async scheduling or set "
+                    "ddtree_disable_tree_verify=True for the flat DFlash path."
+                )
             if self.speculative_config is not None:
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
@@ -949,6 +960,14 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif dflash_ddtree_tree_verify:
+                logger.warning_once(
+                    "Async scheduling is not compatible with dflash_ddtree tree "
+                    "verification yet and will be disabled. Set "
+                    "ddtree_disable_tree_verify=True to use the flat DFlash "
+                    "async path."
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
@@ -1112,6 +1131,9 @@ class VllmConfig:
             or os.environ.get("TORCH_COMPILE_DISABLE") == "1"
             or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
         )
+        sm70_no_compile_decode_graph_requested = (
+            envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
+        )
         sm70_no_compile_decode_graph_explicit = (
             os.environ.get("VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE", "")
             .strip()
@@ -1160,12 +1182,45 @@ class VllmConfig:
                 "VLLM_SM70_FP8_TURBOMIND explicitly to override."
             )
 
+        attention_backend = self.attention_config.backend
+        attention_backend_name = getattr(attention_backend, "name", attention_backend)
+        sm70_flash_v100_backend = (
+            attention_backend is None or attention_backend_name == "FLASH_ATTN_V100"
+        )
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
             and envs.VLLM_SM70_FLASH_ATTN_V100
+            and sm70_flash_v100_backend
         )
         if sm70_flash_v100_baseline:
+            if (
+                self.model_config is not None
+                and self.model_config.multimodal_config is not None
+                and not self.model_config.multimodal_config.language_model_only
+            ):
+                from .multimodal import ImageDummyOptions, VideoDummyOptions
+
+                limit_per_prompt = (
+                    self.model_config.multimodal_config.limit_per_prompt
+                )
+                if not limit_per_prompt:
+                    limit_per_prompt.update(
+                        {
+                            "image": ImageDummyOptions(count=1),
+                            "video": VideoDummyOptions(count=0),
+                        }
+                    )
+                    logger.info_once(
+                        "Using SM70 Flash-V100 multimodal default: image=1, "
+                        "video=0. Set --limit-mm-per-prompt to override."
+                    )
+                elif "video" not in limit_per_prompt:
+                    limit_per_prompt["video"] = VideoDummyOptions(count=0)
+                    logger.info_once(
+                        "Using SM70 Flash-V100 multimodal default: video=0 "
+                        "for partial --limit-mm-per-prompt override."
+                    )
             if (
                 envs.VLLM_FLASH_V100_BFLA_PREFILL
                 and self.model_config is not None
@@ -1202,7 +1257,7 @@ class VllmConfig:
             }
             if (
                 not sm70_compile_disabled_by_user
-                and not sm70_no_compile_decode_graph_explicit
+                and not sm70_no_compile_decode_graph_requested
             ):
                 sm70_baseline_env_defaults[
                     "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH"
@@ -1211,8 +1266,8 @@ class VllmConfig:
                 logger.info_once(
                     "Not auto-setting "
                     "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 for the "
-                    "SM70 Flash-V100 baseline because compile/no-compile "
-                    "behavior was explicitly disabled or overridden."
+                    "SM70 Flash-V100 baseline because no-compile decode graph "
+                    "is requested or compile was explicitly disabled."
                 )
             for env_name, env_value in sm70_baseline_env_defaults.items():
                 if env_name not in os.environ:
@@ -1392,16 +1447,6 @@ class VllmConfig:
                     "Using combo_kernels=True and benchmark_combo_kernel=True "
                     "for SM70 Flash-V100 0.0.3 compile graph quality parity."
                 )
-                if (
-                    self.model_config is not None
-                    and self.model_config.multimodal_config is not None
-                ):
-                    self.model_config.multimodal_config.language_model_only = True
-                    self.model_config.multimodal_config.skip_mm_profiling = True
-                    logger.info_once(
-                        "Using text-only multimodal policy for SM70 Flash-V100 "
-                        "0.0.3 compile graph startup."
-                    )
                 logger.info_once(
                     "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
                     "mode=VLLM_COMPILE, cudagraph_mode=FULL_AND_PIECEWISE, "
@@ -1458,7 +1503,7 @@ class VllmConfig:
             self.compilation_config.mode is not None
             and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
         ):
-            logger.warning(
+            logger.debug_once(
                 "Inductor compilation was disabled by user settings, "
                 "optimizations settings that are only active during "
                 "inductor compilation will be ignored."

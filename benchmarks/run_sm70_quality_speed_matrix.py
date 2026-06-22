@@ -696,10 +696,8 @@ def _default_env(args: argparse.Namespace) -> dict[str, str]:
     env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
     env.setdefault("TRITON_CACHE_AUTOTUNING", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-    env.setdefault("VLLM_USE_AOT_COMPILE", "1")
+    env.setdefault("VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE", "0")
     env.setdefault("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
-    env.setdefault("VLLM_SM70_LM_HEAD_TOP1", "0")
     return env
 
 
@@ -812,7 +810,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--max-model-len", type=int, default=262144)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=8096)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--attention-backend", default="FLASH_ATTN_V100")
     parser.add_argument("--speed-input-len", type=int, default=4096)

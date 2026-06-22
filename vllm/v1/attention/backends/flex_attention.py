@@ -327,6 +327,36 @@ def bidirectional_mask_mod(
     return q_idx >= 0
 
 
+def ddtree_logical_mask(
+    *,
+    base_mask: torch.Tensor,
+    q_req: torch.Tensor,
+    logical_q_idx: torch.Tensor,
+    logical_kv_idx: torch.Tensor,
+    decode_offset: torch.Tensor,
+    parent_ids: torch.Tensor,
+    num_tree_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Apply DDTree ancestor visibility to logical FlexAttention indices."""
+
+    max_tree_slots = parent_ids.shape[1]
+    tree_start = decode_offset[q_req]
+    q_rel = logical_q_idx - tree_start
+    kv_rel = logical_kv_idx - tree_start
+    q_tree_len = num_tree_tokens[q_req]
+    is_tree_node_query = (q_tree_len > 0) & (q_rel > 0) & (q_rel <= q_tree_len)
+
+    visible = (logical_kv_idx < tree_start) | (kv_rel == 0) | (kv_rel == q_rel)
+    ancestor = torch.clamp(q_rel, min=0, max=max_tree_slots - 1).to(torch.long)
+    for _ in range(max_tree_slots):
+        parent = parent_ids[q_req, ancestor]
+        parent = torch.where(parent < 0, torch.zeros_like(parent), parent)
+        visible = visible | (kv_rel == parent)
+        ancestor = torch.clamp(parent, min=0, max=max_tree_slots - 1).to(torch.long)
+
+    return torch.where(is_tree_node_query, visible, base_mask)
+
+
 # Type alias for the block sparsity hint callable signature.
 _block_sparsity_hint_signature = Callable[
     [torch.Tensor, torch.Tensor, int], torch.Tensor
@@ -403,6 +433,8 @@ class FlexAttentionMetadata:
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
+    ddtree_parent_ids: torch.Tensor | None = None
+    ddtree_num_tree_tokens: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -469,7 +501,22 @@ class FlexAttentionMetadata:
             (is_valid, logical_q_idx, logical_kv_idx) = (
                 self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
             )
-            return is_valid & self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            base_mask = self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            if (
+                self.ddtree_parent_ids is not None
+                and self.ddtree_num_tree_tokens is not None
+            ):
+                q_req = self.doc_ids[q_idx]
+                base_mask = ddtree_logical_mask(
+                    base_mask=base_mask,
+                    q_req=q_req,
+                    logical_q_idx=logical_q_idx,
+                    logical_kv_idx=logical_kv_idx,
+                    decode_offset=self.decode_offset,
+                    parent_ids=self.ddtree_parent_ids,
+                    num_tree_tokens=self.ddtree_num_tree_tokens,
+                )
+            return is_valid & base_mask
 
         return final_mask_mod
 
@@ -857,6 +904,8 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
+        ddtree_parent_ids: torch.Tensor | None = None,
+        ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> FlexAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
@@ -923,6 +972,17 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             if uses_paged_kv and not common_attn_metadata.causal
             else causal_mask_mod
         )
+        ddtree_num_tree_tokens = None
+        if ddtree_parent_ids is not None:
+            assert ddtree_parent_ids.ndim == 2
+            assert ddtree_parent_ids.shape[0] == num_reqs
+            assert ddtree_num_tree_tokens_cpu is not None
+            assert ddtree_num_tree_tokens_cpu.ndim == 1
+            assert ddtree_num_tree_tokens_cpu.numel() == num_reqs
+            ddtree_num_tree_tokens = ddtree_num_tree_tokens_cpu.to(
+                ddtree_parent_ids.device,
+                non_blocking=True,
+            )
 
         out = FlexAttentionMetadata(
             causal=common_attn_metadata.causal,
@@ -957,6 +1017,8 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             persistent_kv_indices=self.persistent_kv_indices,
             persistent_kv_num_blocks=self.persistent_kv_num_blocks,
             persistent_doc_ids=self.persistent_doc_ids,
+            ddtree_parent_ids=ddtree_parent_ids,
+            ddtree_num_tree_tokens=ddtree_num_tree_tokens,
         )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.

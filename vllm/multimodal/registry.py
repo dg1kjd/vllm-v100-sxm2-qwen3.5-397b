@@ -131,7 +131,7 @@ class MultiModalRegistry:
             if mm_config.enable_mm_embeds:
                 return True
 
-            logger.info_once(
+            logger.debug_once(
                 "All limits of multimodal modalities supported by the model "
                 "are set to 0, running in text-only mode."
             )

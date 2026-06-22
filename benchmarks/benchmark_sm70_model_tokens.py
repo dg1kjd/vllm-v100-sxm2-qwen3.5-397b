@@ -769,7 +769,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
     dense_capture = _env_bool("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", False)
     flash_no_compile = _env_bool(
         "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE",
-        True,
+        False,
     )
     flash_0dot3_compile = _env_bool(
         "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",

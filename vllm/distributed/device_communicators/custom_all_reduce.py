@@ -296,6 +296,189 @@ class CustomAllreduce:
             )
         return out
 
+    def tile_runtime_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        tile_numel: int = 512,
+        engine_blocks: int = 0,
+        compute_iters: int = 0,
+    ) -> torch.Tensor:
+        if self.disabled:
+            raise RuntimeError("custom allreduce is disabled")
+        if out is None:
+            out = torch.empty_like(inp)
+        ops.tile_runtime_all_reduce(
+            self._ptr,
+            inp,
+            out,
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+            tile_numel,
+            engine_blocks,
+            compute_iters,
+        )
+        return out
+
+    def tile_runtime_all_reduce_engine(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        tile_numel: int = 512,
+        producer_blocks: int = 0,
+        reducer_blocks: int = 0,
+        compute_iters: int = 0,
+    ) -> torch.Tensor:
+        if self.disabled:
+            raise RuntimeError("custom allreduce is disabled")
+        if out is None:
+            out = torch.empty_like(inp)
+        ops.tile_runtime_all_reduce_engine(
+            self._ptr,
+            inp,
+            out,
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+            tile_numel,
+            producer_blocks,
+            reducer_blocks,
+            compute_iters,
+        )
+        return out
+
+    def tile_runtime_wait_reduce(
+        self,
+        staging: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        tile_numel: int = 128,
+        reducer_blocks: int = 0,
+    ) -> torch.Tensor:
+        if self.disabled:
+            raise RuntimeError("custom allreduce is disabled")
+        if out is None:
+            out = torch.empty_like(staging)
+        ops.tile_runtime_wait_reduce(
+            self._ptr,
+            staging,
+            out,
+            tile_numel,
+            reducer_blocks,
+        )
+        return out
+
+    def custom_tile_runtime_all_reduce(
+        self, input: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Graph-compatible TileRT-style TP2 all-reduce experiment.
+
+        This intentionally stays narrower than the normal custom all-reduce
+        dispatcher. It is used only by SM70 AWQ MLP down_proj experiments so
+        we can compare the tile-runtime substrate against the production AR
+        path without changing global dispatch behavior.
+        """
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self.world_size != 2:
+            return None
+        if input.dtype not in (torch.float16, torch.float32):
+            return None
+
+        tile_numel = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL
+        if tile_numel <= 0 or input.numel() != tile_numel:
+            return None
+
+        mode = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE
+        if mode == "inline":
+            return self.tile_runtime_all_reduce(
+                input,
+                tile_numel=tile_numel,
+                engine_blocks=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS,
+            )
+        if mode == "engine":
+            return self.tile_runtime_all_reduce_engine(
+                input,
+                tile_numel=tile_numel,
+                producer_blocks=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS,
+                reducer_blocks=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS,
+            )
+
+        logger.warning_once(
+            "Ignoring invalid VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE=%s; "
+            "expected 'inline' or 'engine'.",
+            mode,
+            scope="global",
+        )
+        return None
+
+    def awq_mlp_down_tile_gemm_reduce(
+        self,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        *,
+        tile_numel: int,
+        reducer_blocks: int,
+        kernel_reducer_blocks: int,
+        overlap: bool,
+    ) -> torch.Tensor | None:
+        if self.disabled:
+            return None
+        if self.world_size != 2:
+            return None
+        if input.dtype != torch.float16 or input.dim() != 2 or input.size(0) != 1:
+            return None
+        out_features = qweight.shape[-1] * 8
+        if out_features <= 0:
+            return None
+        if tile_numel <= 0 or out_features % tile_numel != 0:
+            return None
+        if out_features // tile_numel > 64:
+            return None
+        if input.stride(-1) != 1:
+            input = input.contiguous()
+
+        from vllm import _sm70_ops as sm70_ops
+
+        staging = torch.empty(
+            (input.size(0), out_features), dtype=input.dtype, device=input.device
+        )
+        if self._IS_CAPTURING and torch.cuda.is_current_stream_capturing():
+            out = torch.empty_like(staging)
+            sm70_ops.awq_gemm_sm70_out_tile_reduce(
+                out,
+                staging,
+                input,
+                qweight,
+                scales,
+                group_size,
+                k_ld,
+                q_ld,
+                self._ptr,
+                tile_numel,
+                reducer_blocks,
+                kernel_reducer_blocks,
+                overlap,
+            )
+            return out
+
+        sm70_ops.awq_gemm_sm70_out(
+            staging,
+            input,
+            qweight,
+            scales,
+            group_size,
+            k_ld,
+            q_ld,
+            False,
+        )
+        return self.all_reduce(staging, registered=False)
+
     def custom_top1_argmax(self, input_pair: torch.Tensor) -> torch.Tensor | None:
         if self.disabled:
             return None

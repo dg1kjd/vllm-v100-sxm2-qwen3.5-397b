@@ -1734,9 +1734,33 @@ class EngineArgs:
         has_native_mtp = bool(getattr(text_config, "mtp_num_hidden_layers", 0))
         is_server = getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
         profile_updates: list[str] = []
+        layer_types = getattr(text_config, "layer_types", None) or []
+        has_linear_attention = any(
+            layer_type == "linear_attention" for layer_type in layer_types
+        )
+
+        if is_server and self.enable_prefix_caching is None and has_linear_attention:
+            self.enable_prefix_caching = True
+            profile_updates.append("enable_prefix_caching=True")
+        if (
+            self.enable_prefix_caching
+            and has_linear_attention
+            and self.mamba_cache_mode == CacheConfig.mamba_cache_mode
+        ):
+            self.mamba_cache_mode = "align"
+            profile_updates.append("mamba_cache_mode=align")
 
         if self.speculative_config is None:
-            if is_server and has_native_mtp and not model_config.is_moe:
+            enable_auto_mtp = (
+                os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS")
+                or os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS")
+            )
+            if (
+                enable_auto_mtp
+                and is_server
+                and has_native_mtp
+                and not model_config.is_moe
+            ):
                 self.speculative_config = {
                     "method": "mtp",
                     "num_speculative_tokens": 4,
@@ -1747,6 +1771,13 @@ class EngineArgs:
                     "speculative_config.use_local_argmax_reduction=True"
                 )
             else:
+                if profile_updates:
+                    logger.info_once(
+                        "Applied 1Cat SM70 serving defaults: %s. "
+                        "Set VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1 to opt "
+                        "into automatic MTP4.",
+                        ", ".join(profile_updates),
+                    )
                 return
 
         if not isinstance(self.speculative_config, dict):
@@ -1756,9 +1787,10 @@ class EngineArgs:
             return
 
         if "draft_sample_method" not in self.speculative_config:
-            self.speculative_config["draft_sample_method"] = "probabilistic"
+            draft_sample_method = "greedy" if spec_method == "mtp" else "probabilistic"
+            self.speculative_config["draft_sample_method"] = draft_sample_method
             profile_updates.append(
-                "speculative_config.draft_sample_method=probabilistic"
+                f"speculative_config.draft_sample_method={draft_sample_method}"
             )
 
         if spec_method != "mtp":
@@ -1828,30 +1860,11 @@ class EngineArgs:
                 f"{self.compilation_config.cudagraph_capture_sizes}"
             )
 
-        layer_types = getattr(text_config, "layer_types", None) or []
-        has_linear_attention = any(
-            layer_type == "linear_attention" for layer_type in layer_types
-        )
-        if self.enable_prefix_caching is None and has_linear_attention:
-            # 0.0.3 ran native SM70 MTP on hybrid Qwen/GDN with prefix caching
-            # enabled, then pinned Mamba state to align mode. Leaving prefix
-            # disabled routes GDN through the fixed speculative state slots
-            # instead of the block-aligned state movement path and is not the
-            # validated production baseline.
-            self.enable_prefix_caching = True
-            profile_updates.append("enable_prefix_caching=True")
-        if (
-            self.enable_prefix_caching
-            and has_linear_attention
-            and self.mamba_cache_mode == CacheConfig.mamba_cache_mode
-        ):
-            self.mamba_cache_mode = "align"
-            profile_updates.append("mamba_cache_mode=align")
-
         if profile_updates:
             logger.info_once(
                 "Applied 1Cat SM70 MTP defaults: %s. "
-                "Set VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS=1 to disable.",
+                "Unset VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS or pass an "
+                "explicit non-MTP speculative config to disable automatic MTP.",
                 ", ".join(profile_updates),
             )
 

@@ -34,7 +34,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BatchFeature
-from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
+try:
+    from transformers.models.qwen2_vl import Qwen2VLImageProcessor
+
+    Qwen2VLImageProcessorFast = Qwen2VLImageProcessor
+except ImportError:
+    from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
     smart_resize as image_smart_resize,
 )

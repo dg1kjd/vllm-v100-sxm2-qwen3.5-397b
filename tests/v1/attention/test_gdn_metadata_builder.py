@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
     build_gdn_spec_decode_state_contract,
     gdn_spec_metadata_tensors,
+    get_registered_gdn_spec_metadata_tensors,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -222,7 +223,12 @@ def _effective_spec_initial_state_slots(
     assert meta.spec_state_indices_tensor is not None
     assert meta.num_accepted_tokens is not None
     state_indices = meta.spec_state_indices_tensor
-    accepted_offsets = meta.num_accepted_tokens.to(torch.long) - 1
+    selectors = (
+        meta.spec_state_slot_selectors
+        if meta.spec_state_slot_selectors is not None
+        else meta.num_accepted_tokens
+    )
+    accepted_offsets = selectors.to(torch.long) - 1
     rows = torch.arange(state_indices.shape[0], dtype=torch.long, device=DEVICE)
     return state_indices[rows, accepted_offsets].tolist()
 
@@ -322,6 +328,46 @@ def test_full_cuda_graph_spec_replay_tail_uses_pad_slot(local_gdn_model):
     ]
 
 
+def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=4,
+        use_full_cuda_graph=True,
+        max_cudagraph_capture_size=8,
+    )
+    batch = BatchSpec(seq_lens=[4097], query_lens=[1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+
+    meta = builder.build_for_cudagraph_capture(common)
+
+    assert meta.num_decodes == 1
+    assert meta.num_spec_decodes == 0
+
+
+def test_full_cuda_graph_capture_keeps_spec_state_selector(local_gdn_model):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=4,
+        use_full_cuda_graph=True,
+        max_cudagraph_capture_size=8,
+    )
+    batch = BatchSpec(seq_lens=[4097], query_lens=[5])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    common = common.replace(
+        block_table_tensor=torch.tensor(
+            [[10, 11, 12, 13, 14]], dtype=torch.int32, device=DEVICE
+        )
+    )
+
+    meta = builder.build_for_cudagraph_capture(common)
+
+    assert meta.num_spec_decodes == 1
+    assert meta.num_accepted_tokens is not None
+    assert meta.num_accepted_tokens[0].item() == 5
+    assert meta.spec_state_slot_selectors is not None
+    assert meta.spec_state_slot_selectors[0].item() == 5
+
+
 def test_none_cache_non_spec_uses_legacy_slot0_by_default(local_gdn_model):
     builder = _create_gdn_builder(local_gdn_model, num_speculative_tokens=4)
     batch = BatchSpec(seq_lens=[4097], query_lens=[1])
@@ -394,7 +440,36 @@ def test_none_cache_spec_combination_uses_accepted_state_slot(local_gdn_model):
     assert meta.spec_state_indices_tensor.tolist() == [[10, 11, 12, 13, 14]]
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.tolist() == [3]
+    assert meta.spec_state_slot_selectors is not None
+    assert meta.spec_state_slot_selectors.tolist() == [3]
     assert _effective_spec_initial_state_slots(meta) == [12]
+
+
+def test_spec_state_slot_selector_can_differ_from_accepted_count(local_gdn_model):
+    builder = _create_gdn_builder(local_gdn_model, num_speculative_tokens=4)
+    batch = BatchSpec(seq_lens=[4097], query_lens=[5])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    common = common.replace(
+        block_table_tensor=torch.tensor(
+            [[10, 11, 12, 13, 14]], dtype=torch.int32, device=DEVICE
+        )
+    )
+
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        spec_state_slot_selectors=torch.tensor(
+            [4], dtype=torch.int32, device=DEVICE
+        ),
+        num_decode_draft_tokens_cpu=torch.tensor([4], dtype=torch.int32, device="cpu"),
+    )
+
+    assert meta.num_accepted_tokens is not None
+    assert meta.num_accepted_tokens.tolist() == [2]
+    assert meta.spec_state_slot_selectors is not None
+    assert meta.spec_state_slot_selectors.tolist() == [4]
+    assert _effective_spec_initial_state_slots(meta) == [13]
 
 
 def test_align_cache_non_spec_uses_legacy_slot0_by_default(local_gdn_model):
@@ -612,6 +687,7 @@ def test_align_active_mtp_rollover_contract_near_block_boundary(
         non_spec_token_indx,
         spec_sequence_masks,
         accepted_tokens,
+        spec_state_slot_selectors,
     ) = gdn_spec_metadata_tensors(meta, DEVICE)
     assert non_spec_query_start_loc.numel() == 0
     assert non_spec_state_indices_tensor.numel() == 0
@@ -623,6 +699,27 @@ def test_align_active_mtp_rollover_contract_near_block_boundary(
     assert non_spec_token_indx.numel() == 0
     assert spec_sequence_masks.data_ptr() == meta.spec_sequence_masks.data_ptr()
     assert accepted_tokens.data_ptr() == meta.num_accepted_tokens.data_ptr()
+    assert spec_state_slot_selectors.data_ptr() == (
+        meta.spec_state_slot_selectors.data_ptr()
+    )
+
+
+def test_spec_core_placeholder_registry_includes_state_slot_selector(
+    monkeypatch,
+    local_gdn_model,
+):
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "1")
+
+    _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=4,
+        use_full_cuda_graph=True,
+    )
+    tensors = get_registered_gdn_spec_metadata_tensors("layer.0", DEVICE)
+
+    assert len(tensors) == 9
+    assert tensors[7].numel() > 0
+    assert tensors[8].numel() > 0
 
 
 def test_gdn_state_contract_debug_assert_rejects_pad_accepted_slot(
@@ -684,6 +781,9 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         spec_token_indx=torch.arange(10, dtype=torch.int32, device=DEVICE),
         non_spec_token_indx=torch.empty(0, dtype=torch.int32, device=DEVICE),
         num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32, device=DEVICE),
+        spec_state_slot_selectors=torch.tensor(
+            [4, 5], dtype=torch.int32, device=DEVICE
+        ),
     )
     original_state_rows = live_meta.spec_state_indices_tensor
     original_query_start = live_meta.spec_query_start_loc
@@ -704,6 +804,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     )
     padded_masks = torch.tensor([True, True, False, False], device=DEVICE)
     padded_accepted = torch.tensor([2, 3, 1, 1], dtype=torch.int32, device=DEVICE)
+    padded_selectors = torch.tensor([4, 5, 1, 1], dtype=torch.int32, device=DEVICE)
     spec_token_indx = torch.arange(10, dtype=torch.int32, device=DEVICE)
     non_spec_token_indx = torch.empty(0, dtype=torch.int32, device=DEVICE)
     empty_i32 = torch.empty(0, dtype=torch.int32, device=DEVICE)
@@ -746,7 +847,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     ):
         del conv_state, weight, bias, activation, validate_data
         assert conv_state_indices.data_ptr() == padded_state_rows[:, 0].data_ptr()
-        assert num_accepted_tokens is padded_accepted
+        assert num_accepted_tokens is padded_selectors
         assert query_start_loc is padded_query_start
         assert max_query_len == padded_state_rows.shape[1]
         seen["conv"] = True
@@ -762,7 +863,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     def fake_recurrent(**kwargs):
         assert kwargs["cu_seqlens"] is padded_query_start
         assert kwargs["ssm_state_indices"] is padded_state_rows
-        assert kwargs["num_accepted_tokens"] is padded_accepted
+        assert kwargs["num_accepted_tokens"] is padded_selectors
         assert kwargs["inplace_final_state"] is True
         seen["recurrent"] = True
         out = torch.full((1, mixed_qkv.shape[0], 1, 1), 7.0, device=DEVICE)
@@ -800,6 +901,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
             non_spec_token_indx,
             padded_masks,
             padded_accepted,
+            padded_selectors,
             "layer.0",
         )
 
@@ -972,6 +1074,40 @@ def test_sm70_qwen_gdn_003_spec_core_route_has_priority(
     assert calls == ["layer.0"]
 
 
+def test_ddtree_depth_batches_accepts_verifier_prefix_row() -> None:
+    parent_ids = torch.tensor([[-1, -1, 1, 1]], dtype=torch.int32)
+    num_tree_tokens = torch.tensor([3], dtype=torch.int32)
+    spec_query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
+
+    prefix_rows, batches = qwen_gdn._ddtree_depth_batches(
+        parent_ids=parent_ids,
+        num_tree_tokens_cpu=num_tree_tokens,
+        spec_query_start_loc=spec_query_start_loc,
+        num_spec_decodes=1,
+    )
+
+    assert prefix_rows == [(0, 0)]
+    assert batches[1] == [(1, 0, 0, 1)]
+    assert batches[2] == [(2, 0, 1, 2), (3, 0, 1, 3)]
+
+
+def test_ddtree_depth_batches_keeps_legacy_no_prefix_rows() -> None:
+    parent_ids = torch.tensor([[-1, -1, 1, 1]], dtype=torch.int32)
+    num_tree_tokens = torch.tensor([3], dtype=torch.int32)
+    spec_query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
+
+    prefix_rows, batches = qwen_gdn._ddtree_depth_batches(
+        parent_ids=parent_ids,
+        num_tree_tokens_cpu=num_tree_tokens,
+        spec_query_start_loc=spec_query_start_loc,
+        num_spec_decodes=1,
+    )
+
+    assert prefix_rows == []
+    assert batches[1] == [(0, 0, 0, 1)]
+    assert batches[2] == [(1, 0, 1, 2), (2, 0, 1, 3)]
+
+
 def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
     monkeypatch,
     local_gdn_model,
@@ -1004,6 +1140,7 @@ def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
         non_spec_token_indx,
         spec_sequence_masks,
         num_accepted_tokens,
+        spec_state_slot_selectors,
         layer_name,
     ):
         del (
@@ -1020,6 +1157,7 @@ def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
             non_spec_token_indx,
             spec_sequence_masks,
             num_accepted_tokens,
+            spec_state_slot_selectors,
         )
         calls.append(str(layer_name))
         return core_attn_out

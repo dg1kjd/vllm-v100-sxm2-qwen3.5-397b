@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import builtins
+
 import pytest
 import torch
 from torch import Generator
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+from vllm.v1.sample.ops.topk_topp_sampler import (
+    TopKTopPSampler,
+    apply_top_k_top_p_pytorch,
+)
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -27,7 +32,7 @@ def _flashinfer_topk_topp_supported() -> bool:
         import flashinfer  # noqa: F401
 
         from vllm.v1.attention.backends.flashinfer import FlashInferBackend
-    except ImportError:
+    except Exception:
         return False
     capability = current_platform.get_device_capability()
     if capability is None:
@@ -47,6 +52,45 @@ def reset_default_device():
     original_device = torch.get_default_device()
     yield
     torch.set_default_device(original_device)
+
+
+def test_flashinfer_sampler_default_falls_back_when_import_fails(monkeypatch):
+    from vllm.v1.sample.ops import topk_topp_sampler as sampler_mod
+
+    monkeypatch.delenv("VLLM_USE_FLASHINFER_SAMPLER", raising=False)
+    monkeypatch.setattr(sampler_mod.current_platform, "is_cuda", lambda: True)
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "vllm.v1.attention.backends.flashinfer":
+            raise PermissionError("flashinfer cache is not writable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    sampler = TopKTopPSampler()
+
+    assert sampler.forward.__func__ is TopKTopPSampler.forward_native
+
+
+def test_flashinfer_sampler_explicit_opt_in_raises_when_import_fails(monkeypatch):
+    from vllm.v1.sample.ops import topk_topp_sampler as sampler_mod
+
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "1")
+    monkeypatch.setattr(sampler_mod.current_platform, "is_cuda", lambda: True)
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "vllm.v1.attention.backends.flashinfer":
+            raise PermissionError("flashinfer cache is not writable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(RuntimeError, match="explicitly requested"):
+        TopKTopPSampler()
 
 
 def test_topk_impl_equivalence():

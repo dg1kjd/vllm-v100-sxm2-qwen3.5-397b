@@ -398,7 +398,15 @@ def apply_repetition_penalties(
         output_mask: A boolean tensor indicating which tokens appear in the output.
         repetition_penalties: The repetition penalties of shape (num_seqs, ).
     """
-    if logits.is_cuda and logits.is_contiguous():
+    use_cuda_kernel = logits.is_cuda and logits.is_contiguous()
+    if (
+        use_cuda_kernel
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
+    ):
+        use_cuda_kernel = False
+
+    if use_cuda_kernel:
         apply_repetition_penalties_cuda(
             logits, prompt_mask, output_mask, repetition_penalties
         )
@@ -2956,6 +2964,68 @@ def top1_argmax(
 ) -> None:
     torch.ops._C_custom_ar.top1_argmax(
         fa, input_pair, out, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
+def tile_runtime_all_reduce(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    tile_numel: int,
+    engine_blocks: int,
+    compute_iters: int,
+) -> None:
+    torch.ops._C_custom_ar.tile_runtime_all_reduce(
+        fa,
+        inp,
+        out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        tile_numel,
+        engine_blocks,
+        compute_iters,
+    )
+
+
+def tile_runtime_all_reduce_engine(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    tile_numel: int,
+    producer_blocks: int,
+    reducer_blocks: int,
+    compute_iters: int,
+) -> None:
+    torch.ops._C_custom_ar.tile_runtime_all_reduce_engine(
+        fa,
+        inp,
+        out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        tile_numel,
+        producer_blocks,
+        reducer_blocks,
+        compute_iters,
+    )
+
+
+def tile_runtime_wait_reduce(
+    fa: int,
+    staging: torch.Tensor,
+    out: torch.Tensor,
+    tile_numel: int,
+    reducer_blocks: int,
+) -> None:
+    torch.ops._C_custom_ar.tile_runtime_wait_reduce(
+        fa,
+        staging,
+        out,
+        tile_numel,
+        reducer_blocks,
     )
 
 

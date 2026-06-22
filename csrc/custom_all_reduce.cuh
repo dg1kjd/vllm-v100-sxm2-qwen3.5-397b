@@ -18,6 +18,9 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <vector>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+
+#include "sm70_tile_runtime_signal.cuh"
 
 namespace vllm {
 #define CUDACHECK(cmd)                                              \
@@ -30,42 +33,70 @@ namespace vllm {
     }                                                               \
   } while (0)
 
-// Maximal number of blocks in allreduce kernel.
-constexpr int kMaxBlocks = 36;
+// Maximal number of signal slots. The default production all-reduce still
+// launches at most defaultBlockLimit CTAs unless explicitly overridden.
+constexpr int kMaxBlocks = sm70_tile_runtime::kMaxBlocks;
 
 // Default number of blocks in allreduce kernel.
 #ifndef USE_ROCM
 const int defaultBlockLimit = 36;
-CUpointer_attribute rangeStartAddrAttr = CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
+inline CUpointer_attribute rangeStartAddrAttr =
+    CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 #else
 const int defaultBlockLimit = 16;
-hipPointer_attribute rangeStartAddrAttr =
+inline hipPointer_attribute rangeStartAddrAttr =
     HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 #endif
 
-// Counter may overflow, but it's fine since unsigned int overflow is
-// well-defined behavior.
-using FlagType = uint32_t;
+constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
 
-// Two sets of peer counters are needed for two syncs: starting and ending an
-// operation. The reason is that it's possible for peer GPU block to arrive at
-// the second sync point while the current GPU block haven't passed the first
-// sync point. Thus, peer GPU may write counter+1 while current GPU is busy
-// waiting for counter. We use alternating counter array to avoid this
-// possibility.
-struct Signal {
-  alignas(128) FlagType start[kMaxBlocks][8];
-  alignas(128) FlagType end[kMaxBlocks][8];
-  alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
-};
+inline bool custom_allreduce_current_device_is_sm70() {
+#ifndef USE_ROCM
+  int device = 0;
+  CUDACHECK(cudaGetDevice(&device));
+  if (device >= 0 && device < 64) {
+    static int cached_arch[64] = {};
+    if (cached_arch[device] == 0) {
+      cudaDeviceProp prop{};
+      CUDACHECK(cudaGetDeviceProperties(&prop, device));
+      cached_arch[device] = prop.major * 10 + prop.minor;
+    }
+    return cached_arch[device] == 70;
+  }
+  cudaDeviceProp prop{};
+  CUDACHECK(cudaGetDeviceProperties(&prop, device));
+  return prop.major == 7 && prop.minor == 0;
+#else
+  return false;
+#endif
+}
 
-struct __align__(16) RankData {
-  const void* ptrs[8];
-};
+inline int custom_allreduce_block_limit(int default_limit,
+                                        int world_size,
+                                        size_t bytes) {
+  const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+  if (raw == nullptr || raw[0] == '\0') {
+    if (world_size == 2 && bytes <= kSm70Tp2SmallAllreduceBytes &&
+        custom_allreduce_current_device_is_sm70()) {
+      return 1;
+    }
+    return default_limit;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed <= 0 || parsed > kMaxBlocks) {
+    throw std::runtime_error(
+        "Invalid VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: " + std::string(raw) +
+        ". Expected an integer in [1, " + std::to_string(kMaxBlocks) + "]");
+  }
+  return static_cast<int>(parsed);
+}
 
-struct __align__(16) RankSignals {
-  Signal* signals[8];
-};
+// Counter may overflow, but unsigned integer overflow is well-defined.
+using FlagType = sm70_tile_runtime::FlagType;
+using Signal = sm70_tile_runtime::Signal;
+using RankData = sm70_tile_runtime::RankData;
+using RankSignals = sm70_tile_runtime::RankSignals;
 
 // like std::array, but aligned
 template <typename T, int sz>
@@ -346,6 +377,163 @@ __global__ void __launch_bounds__(512, 1)
 }
 
 template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) sm70_tile_runtime_reduce_kernel(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ staging,
+    T* __restrict__ result, int rank, int packed_size, int tile_packed_size,
+    int tile_count, int compute_iters) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+
+  const int tid = threadIdx.x;
+  auto dp = *_dp;
+
+  for (int tile_id = blockIdx.x; tile_id < tile_count; tile_id += gridDim.x) {
+    const int begin = tile_id * tile_packed_size;
+    const int end = min(begin + tile_packed_size, packed_size);
+
+    unsigned spin = static_cast<unsigned>(tid);
+    for (int idx = begin + tid; idx < end; idx += blockDim.x) {
+      P value = reinterpret_cast<const P*>(input)[idx];
+      for (int iter = 0; iter < compute_iters; ++iter) {
+#if !defined(USE_ROCM)
+        asm volatile("mov.u32 %0, %0;" : "+r"(spin));
+#endif
+      }
+      reinterpret_cast<P*>(staging)[idx] = value;
+    }
+
+    __syncthreads();
+
+    const FlagType flag = self_sg->_flag[tile_id] + 1;
+    if (tid < ngpus) {
+      auto peer_flag = &sg.signals[tid]->start[tile_id][rank];
+      st_flag_sys_visible(peer_flag, flag);
+    }
+
+    if (tid < ngpus) {
+      auto self_flag = &self_sg->start[tile_id][tid];
+      while (ld_flag_sys_visible(self_flag) != flag);
+    }
+
+    __syncthreads();
+
+    for (int idx = begin + tid; idx < end; idx += blockDim.x) {
+      reinterpret_cast<P*>(result)[idx] =
+          packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+    }
+
+    __syncthreads();
+    if (tid == 0) {
+      self_sg->_flag[tile_id] = flag;
+    }
+  }
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) sm70_tile_runtime_engine_kernel(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ staging,
+    T* __restrict__ result, int rank, int packed_size, int tile_packed_size,
+    int tile_count, int producer_blocks, int reducer_blocks,
+    int compute_iters) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+
+  const int tid = threadIdx.x;
+  auto dp = *_dp;
+
+  if (blockIdx.x < producer_blocks) {
+    for (int tile_id = blockIdx.x; tile_id < tile_count;
+         tile_id += producer_blocks) {
+      const int begin = tile_id * tile_packed_size;
+      const int end = min(begin + tile_packed_size, packed_size);
+
+      unsigned spin = static_cast<unsigned>(tid);
+      for (int idx = begin + tid; idx < end; idx += blockDim.x) {
+        P value = reinterpret_cast<const P*>(input)[idx];
+        for (int iter = 0; iter < compute_iters; ++iter) {
+#if !defined(USE_ROCM)
+          asm volatile("mov.u32 %0, %0;" : "+r"(spin));
+#endif
+        }
+        reinterpret_cast<P*>(staging)[idx] = value;
+      }
+
+      __syncthreads();
+
+      const FlagType flag = self_sg->_flag[tile_id] + 1;
+      if (tid < ngpus) {
+        auto peer_flag = &sg.signals[tid]->start[tile_id][rank];
+        st_flag_sys_visible(peer_flag, flag);
+      }
+    }
+    return;
+  }
+
+  const int reducer_block = blockIdx.x - producer_blocks;
+  for (int tile_id = reducer_block; tile_id < tile_count;
+       tile_id += reducer_blocks) {
+    const int begin = tile_id * tile_packed_size;
+    const int end = min(begin + tile_packed_size, packed_size);
+    const FlagType flag = self_sg->_flag[tile_id] + 1;
+
+    if (tid < ngpus) {
+      auto self_flag = &self_sg->start[tile_id][tid];
+      while (ld_flag_sys_visible(self_flag) != flag);
+    }
+
+    __syncthreads();
+
+    for (int idx = begin + tid; idx < end; idx += blockDim.x) {
+      reinterpret_cast<P*>(result)[idx] =
+          packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+    }
+
+    __syncthreads();
+    if (tid == 0) {
+      self_sg->_flag[tile_id] = flag;
+    }
+  }
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1)
+    sm70_tile_runtime_wait_reduce_kernel(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        T* __restrict__ result, int rank, int packed_size,
+        int tile_packed_size, int tile_count) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+
+  const int tid = threadIdx.x;
+  auto dp = *_dp;
+
+  for (int tile_id = blockIdx.x; tile_id < tile_count; tile_id += gridDim.x) {
+    const int begin = tile_id * tile_packed_size;
+    const int end = min(begin + tile_packed_size, packed_size);
+    const FlagType flag = self_sg->_flag[tile_id] + 1;
+
+    if (tid < ngpus) {
+      auto self_flag = &self_sg->start[tile_id][tid];
+      while (ld_flag_sys_visible(self_flag) != flag);
+    }
+
+    __syncthreads();
+
+    for (int idx = begin + tid; idx < end; idx += blockDim.x) {
+      reinterpret_cast<P*>(result)[idx] =
+          packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+    }
+
+    __syncthreads();
+    if (tid == 0) {
+      self_sg->_flag[tile_id] = flag;
+    }
+  }
+}
+
+template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_sum2_1stage(
     RankData* _dp_a, RankData* _dp_b, RankSignals sg, Signal* self_sg,
     T* __restrict__ result, int rank, int size) {
@@ -604,6 +792,28 @@ class CustomAllreduce {
     buffers_[ptrs[rank_]] = d_data;
   }
 
+  RankData* rank_data_for_buffer(cudaStream_t stream, void* buffer,
+                                 const char* op_name) {
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(buffer);
+    } else {
+      auto it = buffers_.find(buffer);
+      if (it == buffers_.end()) {
+        throw std::runtime_error(std::string(op_name) +
+                                 " buffer address " +
+                                 std::to_string(
+                                     reinterpret_cast<uint64_t>(buffer)) +
+                                 " is not registered!");
+      }
+      ptrs = it->second;
+    }
+    return ptrs;
+  }
+
   // Note: when registering graph buffers, we intentionally choose to not
   // deduplicate the addresses. That means if the allocator reuses some
   // addresses, they will be registered again. This is to account for the
@@ -650,6 +860,8 @@ class CustomAllreduce {
   template <typename T>
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
                  int threads = 512, int block_limit = defaultBlockLimit) {
+    block_limit = custom_allreduce_block_limit(
+        block_limit, world_size_, static_cast<size_t>(size) * sizeof(T));
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -743,6 +955,8 @@ class CustomAllreduce {
   void allreduce_sum2(cudaStream_t stream, T* input_a, T* input_b, T* output,
                       int size, int threads = 512,
                       int block_limit = defaultBlockLimit) {
+    block_limit = custom_allreduce_block_limit(
+        block_limit, world_size_, static_cast<size_t>(size) * sizeof(T));
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -832,6 +1046,212 @@ class CustomAllreduce {
     }
 #undef SUM2_CASE
 #undef SUM2_KL
+  }
+
+  template <typename T>
+  void tile_runtime_allreduce(cudaStream_t stream, const T* input, T* staging,
+                              T* output, int size, int tile_numel,
+                              int engine_blocks, int compute_iters) {
+    if (world_size_ != 2) {
+      throw std::runtime_error(
+          "SM70 tile runtime prototype currently supports only TP2.");
+    }
+
+    auto pack = packed_t<T>::P::size;
+    if (size % pack != 0 || tile_numel % pack != 0) {
+      throw std::runtime_error(
+          "SM70 tile runtime prototype requires size and tile_numel to be "
+          "multiples of " +
+          std::to_string(pack));
+    }
+    if (tile_numel <= 0) {
+      throw std::runtime_error("tile_numel must be positive.");
+    }
+
+    const int packed_size = size / pack;
+    const int tile_packed_size = tile_numel / pack;
+    const int tile_count = (packed_size + tile_packed_size - 1) / tile_packed_size;
+    if (tile_count <= 0 || tile_count > kMaxBlocks) {
+      throw std::runtime_error(
+          "SM70 tile runtime prototype supports tile_count in [1, " +
+          std::to_string(kMaxBlocks) + "]. Got " +
+          std::to_string(tile_count));
+    }
+
+    auto it = buffers_.find(staging);
+    if (it == buffers_.end()) {
+      throw std::runtime_error(
+          "tile runtime staging buffer address " +
+          std::to_string(reinterpret_cast<uint64_t>(staging)) +
+          " is not registered!");
+    }
+    RankData* ptrs = it->second;
+
+    const int threads = 256;
+    int blocks = engine_blocks > 0 ? engine_blocks : tile_count;
+    blocks = std::max(1, std::min(blocks, tile_count));
+    compute_iters = std::max(0, compute_iters);
+
+#define TILE_RUNTIME_CASE(ngpus)                                             \
+  case ngpus: {                                                              \
+    sm70_tile_runtime_reduce_kernel<T, ngpus>                                \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, staging, \
+                                         output, rank_, packed_size,          \
+                                         tile_packed_size, tile_count,        \
+                                         compute_iters);                     \
+    break;                                                                   \
+  }
+
+    switch (world_size_) {
+      TILE_RUNTIME_CASE(2)
+      default:
+        throw std::runtime_error(
+            "SM70 tile runtime prototype only supports world_size=2.");
+    }
+#undef TILE_RUNTIME_CASE
+  }
+
+  template <typename T>
+  void tile_runtime_allreduce_engine(cudaStream_t stream, const T* input,
+                                     T* staging, T* output, int size,
+                                     int tile_numel, int producer_blocks,
+                                     int reducer_blocks, int compute_iters) {
+    if (world_size_ != 2) {
+      throw std::runtime_error(
+          "SM70 tile runtime engine currently supports only TP2.");
+    }
+
+    auto pack = packed_t<T>::P::size;
+    if (size % pack != 0 || tile_numel % pack != 0) {
+      throw std::runtime_error(
+          "SM70 tile runtime engine requires size and tile_numel to be "
+          "multiples of " +
+          std::to_string(pack));
+    }
+    if (tile_numel <= 0) {
+      throw std::runtime_error("tile_numel must be positive.");
+    }
+
+    const int packed_size = size / pack;
+    const int tile_packed_size = tile_numel / pack;
+    const int tile_count =
+        (packed_size + tile_packed_size - 1) / tile_packed_size;
+    if (tile_count <= 0 || tile_count > kMaxBlocks) {
+      throw std::runtime_error(
+          "SM70 tile runtime engine supports tile_count in [1, " +
+          std::to_string(kMaxBlocks) + "]. Got " +
+          std::to_string(tile_count));
+    }
+
+    auto it = buffers_.find(staging);
+    if (it == buffers_.end()) {
+      throw std::runtime_error(
+          "tile runtime staging buffer address " +
+          std::to_string(reinterpret_cast<uint64_t>(staging)) +
+          " is not registered!");
+    }
+    RankData* ptrs = it->second;
+
+    producer_blocks =
+        producer_blocks > 0 ? producer_blocks : std::min(tile_count, 4);
+    reducer_blocks = reducer_blocks > 0 ? reducer_blocks : tile_count;
+    producer_blocks = std::max(1, std::min(producer_blocks, tile_count));
+    reducer_blocks = std::max(1, std::min(reducer_blocks, tile_count));
+    compute_iters = std::max(0, compute_iters);
+
+    const int threads = 256;
+    const int blocks = producer_blocks + reducer_blocks;
+
+#define TILE_RUNTIME_ENGINE_CASE(ngpus)                                      \
+  case ngpus: {                                                              \
+    sm70_tile_runtime_engine_kernel<T, ngpus>                                \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, staging, \
+                                         output, rank_, packed_size,          \
+                                         tile_packed_size, tile_count,        \
+                                         producer_blocks, reducer_blocks,     \
+                                         compute_iters);                     \
+    break;                                                                   \
+  }
+
+    switch (world_size_) {
+      TILE_RUNTIME_ENGINE_CASE(2)
+      default:
+        throw std::runtime_error(
+            "SM70 tile runtime engine only supports world_size=2.");
+    }
+#undef TILE_RUNTIME_ENGINE_CASE
+  }
+
+  template <typename T>
+  void tile_runtime_wait_reduce(cudaStream_t stream, T* staging, T* output,
+                                int size, int tile_numel,
+                                int reducer_blocks) {
+    if (world_size_ != 2) {
+      throw std::runtime_error(
+          "SM70 tile runtime wait-reduce currently supports only TP2.");
+    }
+
+    auto pack = packed_t<T>::P::size;
+    if (size % pack != 0 || tile_numel % pack != 0) {
+      throw std::runtime_error(
+          "SM70 tile runtime wait-reduce requires size and tile_numel to be "
+          "multiples of " +
+          std::to_string(pack));
+    }
+    if (tile_numel <= 0) {
+      throw std::runtime_error("tile_numel must be positive.");
+    }
+
+    const int packed_size = size / pack;
+    const int tile_packed_size = tile_numel / pack;
+    const int tile_count =
+        (packed_size + tile_packed_size - 1) / tile_packed_size;
+    if (tile_count <= 0 || tile_count > kMaxBlocks) {
+      throw std::runtime_error(
+          "SM70 tile runtime wait-reduce supports tile_count in [1, " +
+          std::to_string(kMaxBlocks) + "]. Got " +
+          std::to_string(tile_count));
+    }
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(staging);
+    } else {
+      auto it = buffers_.find(staging);
+      if (it == buffers_.end()) {
+        throw std::runtime_error(
+            "tile runtime wait-reduce staging address " +
+            std::to_string(reinterpret_cast<uint64_t>(staging)) +
+            " is not registered!");
+      }
+      ptrs = it->second;
+    }
+
+    reducer_blocks =
+        reducer_blocks > 0 ? reducer_blocks : std::min(tile_count, 4);
+    reducer_blocks = std::max(1, std::min(reducer_blocks, tile_count));
+
+    constexpr int threads = 256;
+
+#define TILE_RUNTIME_WAIT_REDUCE_CASE(ngpus)                                 \
+  case ngpus: {                                                              \
+    sm70_tile_runtime_wait_reduce_kernel<T, ngpus>                           \
+        <<<reducer_blocks, threads, 0, stream>>>(                            \
+            ptrs, sg_, self_sg_, output, rank_, packed_size,                 \
+            tile_packed_size, tile_count);                                   \
+    break;                                                                   \
+  }
+
+    switch (world_size_) {
+      TILE_RUNTIME_WAIT_REDUCE_CASE(2)
+      default:
+        throw std::runtime_error(
+            "SM70 tile runtime wait-reduce only supports world_size=2.");
+    }
+#undef TILE_RUNTIME_WAIT_REDUCE_CASE
   }
 
   void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output) {

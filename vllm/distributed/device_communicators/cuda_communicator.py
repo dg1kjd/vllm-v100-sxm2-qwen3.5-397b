@@ -80,6 +80,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
             use_top1_custom_ar = False
+            use_sm70_awq_mlp_down_tile_ar = False
+            use_sm70_awq_mlp_down_tile_overlap = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
         else:
@@ -87,11 +89,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_top1_custom_ar = envs.VLLM_SM70_TOP1_CUSTOM_AR
+            use_sm70_awq_mlp_down_tile_ar = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR
+            use_sm70_awq_mlp_down_tile_overlap = (
+                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
+            )
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_top1_custom_ar = use_top1_custom_ar
+        self.use_sm70_awq_mlp_down_tile_ar = use_sm70_awq_mlp_down_tile_ar
+        self.use_sm70_awq_mlp_down_tile_overlap = (
+            use_sm70_awq_mlp_down_tile_overlap
+        )
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
 
@@ -134,7 +144,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if (use_custom_allreduce or use_top1_custom_ar) and self.world_size > 1:
+        if (
+            use_custom_allreduce
+            or use_top1_custom_ar
+            or use_sm70_awq_mlp_down_tile_ar
+            or use_sm70_awq_mlp_down_tile_overlap
+        ) and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             # `use_top1_custom_ar` deliberately only provisions the IPC/signaling
             # resources used by the greedy top1 token reducer. It must not make
@@ -386,6 +401,53 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 _trace_all_reduce_path(self, "custom_sum2", input_a)
                 return out
         return self.all_reduce(input_a + input_b)
+
+    def sm70_awq_mlp_down_tile_all_reduce(self, input_):
+        if not self.use_sm70_awq_mlp_down_tile_ar:
+            return None
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        out = ca_comm.custom_tile_runtime_all_reduce(input_)
+        if out is not None:
+            _trace_all_reduce_path(self, "sm70_awq_mlp_down_tile_ar", input_)
+        return out
+
+    def sm70_awq_mlp_down_tile_gemm_reduce(
+        self,
+        input_,
+        qweight,
+        scales,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ):
+        if not self.use_sm70_awq_mlp_down_tile_overlap:
+            return None
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        out = ca_comm.awq_mlp_down_tile_gemm_reduce(
+            input_,
+            qweight,
+            scales,
+            group_size,
+            k_ld,
+            q_ld,
+            tile_numel=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL,
+            reducer_blocks=(
+                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS
+            ),
+            kernel_reducer_blocks=(
+                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS
+            ),
+            overlap=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM,
+        )
+        if out is not None:
+            _trace_all_reduce_path(
+                self, "sm70_awq_mlp_down_tile_overlap", input_
+            )
+        return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

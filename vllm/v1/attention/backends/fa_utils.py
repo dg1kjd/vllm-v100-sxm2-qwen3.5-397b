@@ -180,11 +180,20 @@ def get_flash_attn_version(
             fa_version = 2
 
         if not is_fa_version_supported(fa_version):
-            logger.error(
-                "Cannot use FA version %d is not supported due to %s",
-                fa_version,
-                fa_version_unsupported_reason(fa_version),
-            )
+            reason = fa_version_unsupported_reason(fa_version)
+            if device_capability.major < 8 and fa_version == 2:
+                logger.debug_once(
+                    "Skipping FlashAttention version %d on SM%d: %s",
+                    fa_version,
+                    device_capability.major * 10 + device_capability.minor,
+                    reason,
+                )
+            else:
+                logger.error(
+                    "Cannot use FA version %d is not supported due to %s",
+                    fa_version,
+                    reason,
+                )
 
         assert is_fa_version_supported(fa_version)
         return fa_version

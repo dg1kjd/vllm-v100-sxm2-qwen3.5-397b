@@ -90,6 +90,7 @@ def _select_fused_sigmoid_schedule(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "IS_DDTREE": lambda args: args["ddtree_parent_ids"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -110,6 +111,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    ddtree_parent_ids,
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -128,12 +130,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    stride_parent_ids_seq: tl.constexpr,
+    stride_parent_ids_tok: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    IS_DDTREE: tl.constexpr,
     IS_KDA: tl.constexpr,
     MIXED_QKV: tl.constexpr,
 ):
@@ -187,6 +192,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+                if IS_DDTREE:
+                    i_t = tl.maximum(i_t, 0)
             else:
                 i_t = 0
             # Load state index and check for invalid entries.
@@ -204,6 +211,28 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for i_t in range(0, T):
+        if IS_DDTREE:
+            parent_t = tl.load(
+                ddtree_parent_ids
+                + i_n * stride_parent_ids_seq
+                + i_t * stride_parent_ids_tok
+            ).to(tl.int64)
+            parent_t = tl.where(parent_t < 0, 0, parent_t)
+            reload_t = tl.where(i_t == 0, -1, parent_t)
+            reload_state_idx = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + reload_t * stride_indices_tok,
+                mask=reload_t >= 0,
+                other=-1,
+            ).to(tl.int64)
+            p_h_reload = h0 + reload_state_idx * stride_init_state_token
+            p_h_reload = p_h_reload + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+            reload_h = tl.load(
+                p_h_reload,
+                mask=mask_h & (reload_state_idx >= 0),
+                other=0,
+            ).to(tl.float32)
+            b_h = tl.where((i_t > 0) & (reload_state_idx >= 0), reload_h, b_h)
+
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -281,6 +310,7 @@ def fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
 ):
@@ -329,6 +359,13 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    if ddtree_parent_ids is None:
+        stride_parent_ids_seq, stride_parent_ids_tok = 1, 1
+    elif ddtree_parent_ids.ndim == 1:
+        stride_parent_ids_seq, stride_parent_ids_tok = ddtree_parent_ids.stride(0), 1
+    else:
+        stride_parent_ids_seq, stride_parent_ids_tok = ddtree_parent_ids.stride()
+
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -347,6 +384,7 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        ddtree_parent_ids=ddtree_parent_ids,
         scale=scale,
         N=N,
         T=T,
@@ -365,6 +403,8 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_parent_ids_seq=stride_parent_ids_seq,
+        stride_parent_ids_tok=stride_parent_ids_tok,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
@@ -394,6 +434,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
@@ -450,6 +491,13 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    if ddtree_parent_ids is None:
+        stride_parent_ids_seq, stride_parent_ids_tok = 1, 1
+    elif ddtree_parent_ids.ndim == 1:
+        stride_parent_ids_seq, stride_parent_ids_tok = ddtree_parent_ids.stride(0), 1
+    else:
+        stride_parent_ids_seq, stride_parent_ids_tok = ddtree_parent_ids.stride()
+
     fused_sigmoid_gating_delta_rule_update_kernel[(NK, NV, N * HV)](
         A_log=A_log,
         a=a.contiguous(),
@@ -467,6 +515,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        ddtree_parent_ids=ddtree_parent_ids,
         scale=scale,
         N=N,
         T=T,
@@ -485,6 +534,8 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_parent_ids_seq=stride_parent_ids_seq,
+        stride_parent_ids_tok=stride_parent_ids_tok,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=False,
@@ -581,6 +632,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=None,
+        ddtree_parent_ids=None,
         scale=scale,
         N=N,
         T=T,
@@ -599,6 +651,8 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_parent_ids_seq=1,
+        stride_parent_ids_tok=1,
         INPLACE_FINAL_STATE=True,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=False,

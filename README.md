@@ -23,11 +23,14 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - **AWQ on Volta**: AWQ 4-bit inference paths for dense and MoE Qwen models on
   SM70.
 - **V100 FlashAttention path**: `FLASH_ATTN_V100` decode and prefill backend
-  for Volta GPUs.
+  for Volta GPUs, with SM70 compile-graph, guarded XQA decode, and D=256
+  paged-prefix low-smem fast paths enabled by default.
 - **Long-context serving**: public profiles default to 256K context where the
   model and memory budget allow it.
-- **MTP serving**: Qwen3.6-class MTP speculative decoding with safer defaults
-  for V100.
+- **MTP serving**: Qwen3.6-class MTP speculative decoding remains available as
+  an explicit opt-in path; long-context public profiles default to no MTP.
+- **Image inputs by default**: SM70 `FLASH_ATTN_V100` profiles allow one image
+  per prompt by default; video inputs remain opt-in.
 - **Tool calling and OpenAI API compatibility**: validated with OpenAI-style
   clients such as Cherry Studio, OpenClaw, and similar tools.
 - **Experimental FP8 work**: FP8 model and KV-cache paths are included for
@@ -45,19 +48,32 @@ Replace them with your local model path or a Hugging Face repository id.
 
 ## Hardware Target
 
-The public commands are written for V100 text-generation workloads.
+The public commands are written for V100 Qwen serving workloads. Image inputs
+are enabled by default on the SM70 `FLASH_ATTN_V100` path; video inputs are
+disabled by default and should be enabled explicitly only after local memory
+validation.
 
 | Host | Notes |
 | --- | --- |
 | 4 x Tesla V100 32 GB | Main public reference target |
-| 2 x Tesla V100 32 GB | Supported for selected 27B MTP profiles with lower concurrency |
+| 2 x Tesla V100 32 GB | Supported for selected 27B profiles with lower concurrency |
 
 Typical model placement:
 
-- `Qwen3.5-27B-AWQ`: TP1/TP2/TP4 supported; TP4 is the public reference.
-- `Qwen3.6-27B-AWQ`: TP4 public MTP profile; TP2 memory-constrained profile.
+- `Qwen3.6-27B-AWQ`: TP1/TP2/TP4 supported; TP4 is the public reference.
+- `Qwen3.6-27B-AWQ + MTP`: explicit opt-in profile for local validation, not
+  the long-context public default.
 - `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
 - `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
+
+Multimodal defaults:
+
+- Default SM70 `FLASH_ATTN_V100` serving allows `image=1`, `video=0` when
+  `--limit-mm-per-prompt` is not set.
+- For text-only serving, pass `--limit-mm-per-prompt '{"image":0,"video":0}'`
+  or use `--language-model-only`.
+- For video workloads, pass an explicit limit such as
+  `--limit-mm-per-prompt '{"image":1,"video":1}'` and retune memory settings.
 
 ## Validated Stack
 
@@ -114,18 +130,18 @@ Download the latest wheel assets from:
 https://github.com/1CatAI/1Cat-vLLM/releases/latest
 ```
 
-Install both wheels from the directory where you downloaded them:
+Install the wheel from the directory where you downloaded it:
 
 ```bash
 python -m pip install --prefer-binary --no-cache-dir \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  ./flash_attn_v100-*.whl \
   ./1cat_vllm-*.whl
 ```
 
 Notes:
 
-- Install `flash_attn_v100` and `vllm` together.
+- The `1cat_vllm` wheel already bundles the `flash_attn_v100` Python package
+  and SM70 CUDA extensions.
 - Runtime installation from wheels does not require the bundled `lmdeploy`
   source tree.
 - Use Python 3.12 and CUDA 12.8.
@@ -142,13 +158,14 @@ Notes:
 ```bash
 python - <<'PY'
 import torch, triton, vllm, sys
-import flash_attn_v100_cuda, paged_kv_utils
+import flash_attn_v100
+from flash_attn_v100 import flash_attn_v100_cuda, paged_kv_utils
 print("python", sys.version.split()[0])
 print("torch", torch.__version__)
 print("torch_cuda", torch.version.cuda)
 print("triton", triton.__version__)
 print("vllm", vllm.__version__)
-print("flash_attn_v100", "ok")
+print("flash_attn_v100", flash_attn_v100.__version__)
 PY
 ```
 
@@ -239,6 +256,22 @@ DFlash is included as an experimental path for continued validation. Treat it
 as a research feature until you have validated speed and output quality on your
 own workload.
 
+### MTP
+
+MTP is not enabled by default in the V100 public serving profile. Long-context
+decode on V100 can slow down significantly when MTP is enabled, so keep the
+default no-MTP path for 128K/256K style serving unless your own workload proves
+otherwise.
+
+To explicitly test the previous automatic SM70 MTP4 profile:
+
+```bash
+export VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1
+```
+
+You can also pass an explicit `--speculative-config` when you want full control
+over speculative decoding settings.
+
 ### Dense F16 Fast Path
 
 `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is intended for targeted experiments.
@@ -251,12 +284,12 @@ Source build is supported, but it is **not recommended** for normal runtime
 deployment. Install the release wheels first unless you are changing CUDA,
 C++, or Triton code.
 
-This repository includes the validated `lmdeploy` source tree needed by the
-SM70 AWQ build path.
+This repository includes the validated `lmdeploy` source tree under
+`csrc/sm70_turbomind/lmdeploy`, which is needed by the SM70 AWQ build path.
 
 ```bash
 cd /path/to/1Cat-vLLM/vllm
-test -d lmdeploy
+test -d csrc/sm70_turbomind/lmdeploy
 ```
 
 Install build dependencies:
@@ -265,7 +298,7 @@ Install build dependencies:
 source /path/to/miniconda3/etc/profile.d/conda.sh
 conda activate 1cat-vllm-sm70
 
-python -m pip install -r requirements/build.txt
+python -m pip install -r requirements/build/cuda.txt
 python -m pip install -r requirements/cuda.txt
 python -m pip install -r requirements/common.txt
 python -m pip install cmake build

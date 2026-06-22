@@ -367,11 +367,15 @@ class AWQLinearMethod(LinearMethodBase):
                 "and the SM70 TurboMind extension."
             )
 
+        is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
+        use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_AWQ_MLP_ENGINE
+
         tm_weight, tm_scales, meta = sm70_ops.awq_sm70_prepare(
             layer.qweight,
             layer.scales,
             layer.qzeros,
             group_size,
+            use_gated_silu,
         )
         layer._awq_sm70_weight = tm_weight
         layer._awq_sm70_scales = tm_scales
@@ -379,6 +383,12 @@ class AWQLinearMethod(LinearMethodBase):
         layer._awq_sm70_q_ld = int(meta[1])
         layer._awq_sm70_group_size = group_size
         layer._awq_sm70_prepared = True
+        if use_gated_silu:
+            layer._awq_sm70_gated_silu = True
+            layer._awq_sm70_gated_silu_primary = True
+            logger.info_once(
+                "SM70 AWQ dense MLP gated-SiLU single-layout path enabled."
+            )
 
         # The runtime path consumes only the TurboMind-packed tensors above.
         # Releasing the original AWQ tensors matches the 0.0.3 SM70 path and
@@ -396,6 +406,56 @@ class AWQLinearMethod(LinearMethodBase):
             requires_grad=False,
         )
         logger.info_once("SM70 AWQ TurboMind dense path enabled.")
+
+    @staticmethod
+    def _is_sm70_gated_silu_layer(layer: torch.nn.Module) -> bool:
+        prefix = getattr(layer, "prefix", "")
+        if prefix.rsplit(".", 1)[-1] != "gate_up_proj":
+            return False
+        output_partition_sizes = getattr(layer, "output_partition_sizes", None)
+        return (
+            isinstance(output_partition_sizes, list)
+            and len(output_partition_sizes) == 2
+            and output_partition_sizes[0] == output_partition_sizes[1]
+        )
+
+    def apply_fused_silu_and_mul(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not envs.VLLM_SM70_AWQ_MLP_ENGINE:
+            return None
+        if not getattr(layer, "_awq_sm70_gated_silu", False):
+            return None
+        if not getattr(layer, "_awq_sm70_prepared", False):
+            return None
+        if getattr(layer, "tp_size", 1) != 2:
+            return None
+
+        x_2d = x.reshape(-1, x.shape[-1])
+        if x_2d.shape[0] != 1:
+            return None
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
+
+        out_features = layer.output_size_per_partition // 2
+        out_2d = torch.empty(
+            (x_2d.shape[0], out_features),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        sm70_ops.awq_gemm_sm70_out(
+            out_2d,
+            x_2d,
+            layer._awq_sm70_weight,
+            layer._awq_sm70_scales,
+            layer._awq_sm70_group_size,
+            layer._awq_sm70_k_ld,
+            layer._awq_sm70_q_ld,
+            True,
+        )
+        return out_2d.reshape(*x.shape[:-1], out_features)
 
     def apply(
         self,
@@ -429,6 +489,13 @@ class AWQLinearMethod(LinearMethodBase):
                 layer._awq_sm70_k_ld,
                 layer._awq_sm70_q_ld,
             )
+            if getattr(layer, "_awq_sm70_gated_silu_primary", False):
+                out_features = out_shape[-1] // 2
+                out = (
+                    out.reshape(reshaped_x.shape[0], out_features, 2)
+                    .transpose(1, 2)
+                    .reshape(reshaped_x.shape[0], out_shape[-1])
+                )
         elif FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
             # Batch invariant mode requires torch.matmul path for Triton override.
             out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)

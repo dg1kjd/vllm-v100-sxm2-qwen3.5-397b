@@ -241,10 +241,10 @@ def test_default_chat_template_kwargs_complex(serve_parser):
     }
 
 
-def test_default_chat_template_kwargs_default_none(serve_parser):
-    """Ensure default_chat_template_kwargs defaults to None"""
+def test_default_chat_template_kwargs_default_disable_thinking(serve_parser):
+    """Ensure default_chat_template_kwargs disables thinking by default."""
     args = serve_parser.parse_args(args=[])
-    assert args.default_chat_template_kwargs is None
+    assert args.default_chat_template_kwargs == {"enable_thinking": False}
 
 
 def test_default_chat_template_kwargs_invalid_json(serve_parser):

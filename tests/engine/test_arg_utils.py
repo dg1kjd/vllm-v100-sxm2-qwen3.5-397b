@@ -4,6 +4,7 @@
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
+from types import SimpleNamespace
 from typing import Annotated, Literal
 
 import pytest
@@ -24,6 +25,7 @@ from vllm.engine.arg_utils import (
     parse_type,
 )
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.usage.usage_lib import UsageContext
 
 
 @pytest.mark.parametrize(
@@ -213,6 +215,105 @@ def test_hf_token_get_kwargs():
     assert kwargs["nargs"] == "?"
     assert kwargs["const"] is True
     assert "action" not in kwargs
+
+
+class _FakeSM70Platform:
+
+    @staticmethod
+    def is_cuda_alike():
+        return True
+
+    @staticmethod
+    def get_device_capability():
+        return SimpleNamespace(major=7, minor=0)
+
+
+def _fake_qwen_hybrid_model_config():
+    return SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            mtp_num_hidden_layers=1,
+            layer_types=["linear_attention", "full_attention"],
+        ),
+        is_moe=False,
+    )
+
+
+def _apply_sm70_defaults(monkeypatch, *, env=None, speculative_config=None):
+    for key in (
+        "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS",
+        "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS",
+        "VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS",
+        "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("vllm.engine.arg_utils.current_platform", _FakeSM70Platform())
+
+    args = EngineArgs(model="dummy", tensor_parallel_size=4)
+    args.speculative_config = speculative_config
+    args._maybe_apply_sm70_mtp_defaults(
+        UsageContext.OPENAI_API_SERVER,
+        _fake_qwen_hybrid_model_config(),
+    )
+    return args
+
+
+def test_sm70_serving_defaults_do_not_auto_enable_mtp(monkeypatch):
+    args = _apply_sm70_defaults(monkeypatch)
+
+    assert args.speculative_config is None
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
+    assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        env={"VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1"},
+    )
+
+    assert args.speculative_config == {
+        "method": "mtp",
+        "num_speculative_tokens": 4,
+        "use_local_argmax_reduction": True,
+        "draft_sample_method": "greedy",
+        "attention_backend": "TRITON_ATTN",
+    }
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
+    assert args.max_num_seqs == 4
+    assert args.compilation_config.cudagraph_capture_sizes == [
+        1,
+        2,
+        4,
+        5,
+        8,
+        9,
+        10,
+        15,
+        18,
+        20,
+    ]
+
+
+def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 2},
+    )
+
+    assert args.speculative_config == {
+        "method": "mtp",
+        "num_speculative_tokens": 2,
+        "draft_sample_method": "greedy",
+        "use_local_argmax_reduction": True,
+        "attention_backend": "TRITON_ATTN",
+    }
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
+    assert args.max_num_seqs == 4
 
 
 @pytest.mark.parametrize(

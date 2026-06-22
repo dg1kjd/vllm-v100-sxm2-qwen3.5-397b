@@ -147,7 +147,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.input_global_scale * layer.weight_global_scale, requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind_or_marlin(
+        if sm70_tm.should_prepare_turbomind(
             layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
         ):
             logger.info_once(

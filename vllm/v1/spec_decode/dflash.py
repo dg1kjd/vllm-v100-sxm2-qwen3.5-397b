@@ -16,6 +16,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.ddtree_payload import (
+    DDTreeDraftPayload,
+    build_ddtree_payloads_from_logits,
+)
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -26,6 +31,15 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _ddtree_debug_enabled() -> bool:
+    return os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0") == "1"
+
+
+def _ddtree_debug_log(message: str, *args: object) -> None:
+    if _ddtree_debug_enabled():
+        logger.info("DFlash DDTree proposer debug: " + message, *args)
+
+
 class DFlashProposer(SpecDecodeBaseProposer):
     def __init__(
         self,
@@ -34,12 +48,30 @@ class DFlashProposer(SpecDecodeBaseProposer):
         runner=None,
     ):
         assert vllm_config.speculative_config is not None
-        assert vllm_config.speculative_config.method == "dflash"
+        assert vllm_config.speculative_config.use_dflash()
         super().__init__(
             vllm_config=vllm_config,
             device=device,
             pass_hidden_states_to_model=True,
             runner=runner,
+        )
+        self.use_ddtree = vllm_config.speculative_config.use_dflash_ddtree()
+        self.ddtree_budget = vllm_config.speculative_config.ddtree_budget
+        self.ddtree_top_k = vllm_config.speculative_config.ddtree_top_k
+        self.ddtree_chain_seed = vllm_config.speculative_config.ddtree_chain_seed
+        self.ddtree_disable_tree_verify = (
+            vllm_config.speculative_config.ddtree_disable_tree_verify
+        )
+        self._last_ddtree_payloads: tuple[DDTreeDraftPayload, ...] | None = None
+        _ddtree_debug_log(
+            "init use_ddtree=%s budget=%s top_k=%s chain_seed=%s "
+            "disable_tree_verify=%s num_spec=%s",
+            self.use_ddtree,
+            self.ddtree_budget,
+            self.ddtree_top_k,
+            self.ddtree_chain_seed,
+            self.ddtree_disable_tree_verify,
+            self.num_speculative_tokens,
         )
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
@@ -156,6 +188,77 @@ class DFlashProposer(SpecDecodeBaseProposer):
         if gids:
             return gids[0]
         return self.kv_cache_gid
+
+    def take_last_ddtree_payloads(self) -> tuple[DDTreeDraftPayload, ...] | None:
+        return self._last_ddtree_payloads
+
+    @override
+    def _sample_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        logits: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.use_ddtree or spec_step_idx != 0:
+            _ddtree_debug_log(
+                "skip build use_ddtree=%s spec_step_idx=%s hidden_shape=%s",
+                self.use_ddtree,
+                spec_step_idx,
+                tuple(hidden_states.shape),
+            )
+            return super()._sample_draft_tokens(
+                hidden_states,
+                sampling_metadata,
+                logits,
+                spec_step_idx=spec_step_idx,
+            )
+
+        self._last_ddtree_payloads = None
+        if logits is None:
+            logits = self._compute_logits_for_step(hidden_states, spec_step_idx)
+        payload_logits = logits.detach()
+        draft_token_ids, draft_probs = super()._sample_draft_tokens(
+            hidden_states,
+            sampling_metadata,
+            logits,
+            spec_step_idx=spec_step_idx,
+        )
+
+        batch_size, remainder = divmod(
+            int(draft_token_ids.numel()), self.num_speculative_tokens
+        )
+        if remainder != 0:
+            raise ValueError(
+                "DFlash DDTree draft rows must be divisible by "
+                f"num_speculative_tokens={self.num_speculative_tokens}"
+            )
+        self._last_ddtree_payloads = build_ddtree_payloads_from_logits(
+            logits=payload_logits,
+            batch_size=batch_size,
+            num_speculative_tokens=self.num_speculative_tokens,
+            budget=self.ddtree_budget or self.num_speculative_tokens,
+            top_k=self.ddtree_top_k,
+            chain_seed=self.ddtree_chain_seed,
+            flat_draft_token_ids=draft_token_ids.view(
+                batch_size,
+                self.num_speculative_tokens,
+            ),
+        )
+        if self._last_ddtree_payloads:
+            first_payload = self._last_ddtree_payloads[0]
+            _ddtree_debug_log(
+                "built payloads batch=%s flat_len=%s tree_len=%s "
+                "has_extra_nodes=%s",
+                len(self._last_ddtree_payloads),
+                len(first_payload.flat_draft_token_ids),
+                len(first_payload.tree_token_ids),
+                len(first_payload.tree_token_ids)
+                > len(first_payload.flat_draft_token_ids),
+            )
+        else:
+            _ddtree_debug_log("built no payloads batch=%s", batch_size)
+        return draft_token_ids, draft_probs
 
     @override
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:

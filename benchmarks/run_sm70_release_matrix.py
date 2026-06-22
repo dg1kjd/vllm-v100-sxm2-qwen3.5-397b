@@ -1177,20 +1177,44 @@ def _run_prefix_probe(
             "finish_reason": finish_reason,
             "stop_reason": stop_reason,
             "metrics": _request_metrics(outputs[0], elapsed_s, len(prompt_ids)),
+            "num_cached_tokens": getattr(outputs[0], "num_cached_tokens", None),
             "token_hash": _sha256_ids(token_ids),
             "text_hash": _sha256_text(text),
         })
     first_ttft = records[0]["metrics"].get("ttft_s")
     second_ttft = records[1]["metrics"].get("ttft_s")
+    ttft_ratio = second_ttft / first_ttft if first_ttft and second_ttft else None
+    token_hash_match = records[0]["token_hash"] == records[1]["token_hash"]
+    text_hash_match = records[0]["text_hash"] == records[1]["text_hash"]
+    second_cached_tokens = records[1]["num_cached_tokens"]
+    failure_reasons = []
+    if second_cached_tokens is None:
+        failure_reasons.append("missing_num_cached_tokens")
+    elif second_cached_tokens <= 0:
+        failure_reasons.append("no_prefix_cache_hit")
+    if ttft_ratio is None:
+        failure_reasons.append("missing_ttft")
+    elif ttft_ratio > args.prefix_probe_max_ttft_ratio:
+        failure_reasons.append(
+            f"ttft_ratio {ttft_ratio:.4f} > "
+            f"{args.prefix_probe_max_ttft_ratio:.4f}"
+        )
+    if not token_hash_match:
+        failure_reasons.append("token_hash_mismatch")
+    if not text_hash_match:
+        failure_reasons.append("text_hash_mismatch")
     return {
         "enabled": True,
         "input_len": args.prefix_probe_input_len,
         "output_len": args.prefix_probe_output_len,
         "records": records,
-        "ttft_ratio_second_over_first": (
-            second_ttft / first_ttft if first_ttft and second_ttft else None
-        ),
-        "passed": True,
+        "ttft_ratio_second_over_first": ttft_ratio,
+        "max_ttft_ratio": args.prefix_probe_max_ttft_ratio,
+        "second_num_cached_tokens": second_cached_tokens,
+        "token_hash_match": token_hash_match,
+        "text_hash_match": text_hash_match,
+        "failure_reasons": failure_reasons,
+        "passed": not failure_reasons,
     }
 
 
@@ -1964,7 +1988,7 @@ def _gate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 failures.append("longbench_garble")
             if not isinstance(row.get("longbench_average_score"), (int, float)):
                 failures.append("missing_longbench_score")
-        if "prefix" in phases and row.get("prefix_cache_probe_passed") is False:
+        if "prefix" in phases and row.get("prefix_cache_probe_passed") is not True:
             failures.append("prefix_probe")
 
         baseline_auto = by_key.get(_base_auto_key(row))
@@ -2135,10 +2159,8 @@ def _default_env(args: argparse.Namespace, case: CaseSpec,
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_ymzx")
     env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
     env.setdefault("TRITON_CACHE_AUTOTUNING", "1")
-    env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-    env.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    env.setdefault("VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE", "0")
     env.setdefault("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
-    env.setdefault("VLLM_SM70_LM_HEAD_TOP1", "0")
     env.setdefault("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
     env["VLLM_SM70_QUANT_BACKEND"] = case.backend
     if case.kv_cache_dtype.startswith("turboquant"):
@@ -2501,6 +2523,13 @@ def _parse_args() -> argparse.Namespace:
                         default="coding")
     parser.add_argument("--prefix-probe-input-len", type=int, default=2048)
     parser.add_argument("--prefix-probe-output-len", type=int, default=32)
+    parser.add_argument(
+        "--prefix-probe-max-ttft-ratio",
+        type=float,
+        default=0.90,
+        help=("Require the second identical prompt TTFT to be at most this "
+              "fraction of the first prompt TTFT during the prefix phase."),
+    )
     parser.add_argument("--quality-max-tokens", type=int, default=6000)
     parser.add_argument("--quality-repeat", type=int, default=1)
     parser.add_argument("--quality-prompt-id", action="append")

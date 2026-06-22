@@ -116,7 +116,6 @@ from .utils import (
 
 logger = init_logger(__name__)
 
-
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
     raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
     if raw is None:

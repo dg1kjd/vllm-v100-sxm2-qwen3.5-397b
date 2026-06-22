@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -59,6 +60,15 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _ddtree_debug_enabled() -> bool:
+    return os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0") == "1"
+
+
+def _ddtree_debug_log(message: str, *args: object) -> None:
+    if _ddtree_debug_enabled():
+        logger.info("DFlash DDTree debug: " + message, *args)
 
 
 class Scheduler(SchedulerInterface):
@@ -153,6 +163,33 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        speculative_config = vllm_config.speculative_config
+        # req_id -> latest DDTree payload returned by a dflash_ddtree drafter.
+        self.ddtree_payloads_by_req_id: dict[str, object] = {}
+        self.dflash_ddtree_tree_verify = (
+            speculative_config is not None
+            and speculative_config.use_dflash_ddtree()
+            and not speculative_config.ddtree_disable_tree_verify
+        )
+        # A branched DDTree accept path is not necessarily a prefix of the
+        # scheduled tree-token order. Attention-only models compact accepted
+        # DDTree KV rows in the worker. Hybrid models still need equivalent
+        # GDN/Mamba state compaction, so keep them on flat-chain-equivalent
+        # payloads for now.
+        self.dflash_ddtree_enable_hybrid_tree_state = (
+            os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0") == "1"
+        )
+        self.dflash_ddtree_allow_branched_tree = self.dflash_ddtree_tree_verify and (
+            not vllm_config.model_config.is_hybrid
+            or self.dflash_ddtree_enable_hybrid_tree_state
+        )
+        _ddtree_debug_log(
+            "init tree_verify=%s allow_branched=%s hybrid=%s hybrid_tree_state=%s",
+            self.dflash_ddtree_tree_verify,
+            self.dflash_ddtree_allow_branched_tree,
+            vllm_config.model_config.is_hybrid,
+            self.dflash_ddtree_enable_hybrid_tree_state,
+        )
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -208,7 +245,6 @@ class Scheduler(SchedulerInterface):
             else EncoderCacheManager(cache_size=encoder_cache_size)
         )
 
-        speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
@@ -222,7 +258,9 @@ class Scheduler(SchedulerInterface):
                 # DFlash requires an extra lookahead slot since it uses in-fill-style
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = self.num_spec_tokens + 1
+                self.num_lookahead_tokens = (
+                    speculative_config.num_speculative_state_tokens() + 1
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -280,6 +318,74 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    @staticmethod
+    def _ddtree_payload_is_flat_chain(payload: object) -> bool:
+        is_flat_chain = getattr(payload, "is_flat_chain", None)
+        if callable(is_flat_chain):
+            return bool(is_flat_chain())
+        flat = getattr(payload, "flat_draft_token_ids", ())
+        tree = getattr(payload, "tree_token_ids", ())
+        parents = tuple(getattr(payload, "parent_indices", ()))
+        depths = tuple(getattr(payload, "node_depths", ()))
+        num_nodes = len(tree)
+        expected_parents = () if num_nodes == 0 else (-1,) + tuple(range(num_nodes - 1))
+        expected_depths = tuple(range(1, num_nodes + 1))
+        return (
+            tuple(tree) == tuple(flat)
+            and parents == expected_parents
+            and depths == expected_depths
+        )
+
+    def _ddtree_payload_for_tree_schedule(
+        self,
+        request: Request,
+    ) -> object | None:
+        if not self.dflash_ddtree_tree_verify or not request.spec_token_ids:
+            _ddtree_debug_log(
+                "payload unavailable req=%s tree_verify=%s spec_len=%d",
+                request.request_id,
+                self.dflash_ddtree_tree_verify,
+                len(request.spec_token_ids),
+            )
+            return None
+        payload = self.ddtree_payloads_by_req_id.get(request.request_id)
+        if payload is None:
+            _ddtree_debug_log(
+                "payload missing req=%s spec_len=%d",
+                request.request_id,
+                len(request.spec_token_ids),
+            )
+            return None
+        if tuple(request.spec_token_ids) != getattr(
+            payload, "flat_draft_token_ids", ()
+        ):
+            _ddtree_debug_log(
+                "payload flat mismatch req=%s spec_len=%d flat_len=%d",
+                request.request_id,
+                len(request.spec_token_ids),
+                len(getattr(payload, "flat_draft_token_ids", ())),
+            )
+            return None
+        if (
+            not self.dflash_ddtree_allow_branched_tree
+            and not self._ddtree_payload_is_flat_chain(payload)
+        ):
+            _ddtree_debug_log(
+                "payload rejected branched req=%s tree_len=%d flat_len=%d",
+                request.request_id,
+                len(getattr(payload, "tree_token_ids", ())),
+                len(getattr(payload, "flat_draft_token_ids", ())),
+            )
+            return None
+        _ddtree_debug_log(
+            "payload ready req=%s tree_len=%d flat_len=%d is_flat=%s",
+            request.request_id,
+            len(getattr(payload, "tree_token_ids", ())),
+            len(getattr(payload, "flat_draft_token_ids", ())),
+            self._ddtree_payload_is_flat_chain(payload),
+        )
+        return payload
 
     def _mamba_block_aligned_split(
         self,
@@ -360,6 +466,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_ddtree_payloads: dict[str, object] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -392,6 +499,42 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            ddtree_payload_for_tree_schedule = (
+                self._ddtree_payload_for_tree_schedule(request)
+            )
+            if ddtree_payload_for_tree_schedule is not None:
+                flat_len = len(request.spec_token_ids)
+                tree_len = len(
+                    getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
+                )
+                tree_num_new_tokens = num_new_tokens + max(0, tree_len - flat_len)
+                threshold = self.scheduler_config.long_prefill_token_threshold
+                max_len_tokens = self.max_model_len - 1 - request.num_computed_tokens
+                _ddtree_debug_log(
+                    "schedule candidate req=%s base_new=%d tree_new=%d "
+                    "flat_len=%d tree_len=%d token_budget=%d threshold=%d "
+                    "max_len_tokens=%d",
+                    request.request_id,
+                    num_new_tokens,
+                    tree_num_new_tokens,
+                    flat_len,
+                    tree_len,
+                    token_budget,
+                    threshold,
+                    max_len_tokens,
+                )
+                if (
+                    tree_len > flat_len
+                    and (threshold <= 0 or tree_num_new_tokens <= threshold)
+                    and tree_num_new_tokens <= token_budget
+                    and tree_num_new_tokens <= max_len_tokens
+                ):
+                    num_new_tokens = tree_num_new_tokens
+                    _ddtree_debug_log(
+                        "schedule expanded req=%s num_new=%d",
+                        request.request_id,
+                        num_new_tokens,
+                    )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -424,6 +567,28 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+            if ddtree_payload_for_tree_schedule is not None:
+                flat_len = len(request.spec_token_ids)
+                tree_len = len(
+                    getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
+                )
+                num_scheduled_spec_tokens = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                    - request.num_output_placeholders
+                )
+                if num_scheduled_spec_tokens not in (flat_len, tree_len):
+                    _ddtree_debug_log(
+                        "schedule restoring flat req=%s scheduled_spec=%d "
+                        "flat_len=%d tree_len=%d num_new_before=%d",
+                        request.request_id,
+                        num_scheduled_spec_tokens,
+                        flat_len,
+                        tree_len,
+                        num_new_tokens,
+                    )
+                    num_new_tokens -= num_scheduled_spec_tokens - flat_len
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -470,6 +635,7 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            scheduled_ddtree_payloads.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
@@ -512,14 +678,45 @@ class Scheduler(SchedulerInterface):
                     - request.num_output_placeholders
                 )
                 if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = list(
-                        request.spec_token_ids[:num_scheduled_spec_tokens]
+                    ddtree_payload = self._ddtree_payload_for_tree_schedule(request)
+                    ddtree_tree_token_ids = (
+                        getattr(ddtree_payload, "tree_token_ids", ())
+                        if ddtree_payload is not None
+                        else ()
                     )
+                    if (
+                        ddtree_payload is not None
+                        and num_scheduled_spec_tokens == len(ddtree_tree_token_ids)
+                    ):
+                        spec_token_ids = list(ddtree_tree_token_ids)
+                        scheduled_ddtree_payloads[request_id] = ddtree_payload
+                        _ddtree_debug_log(
+                            "scheduled tree req=%s spec_len=%d",
+                            request_id,
+                            len(spec_token_ids),
+                        )
+                    else:
+                        spec_token_ids = list(
+                            request.spec_token_ids[:num_scheduled_spec_tokens]
+                        )
+                        _ddtree_debug_log(
+                            "scheduled flat req=%s spec_len=%d tree_len=%d",
+                            request_id,
+                            len(spec_token_ids),
+                            len(ddtree_tree_token_ids),
+                        )
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    if (
+                        ddtree_payload is not None
+                        and tuple(spec_token_ids)
+                        == getattr(ddtree_payload, "flat_draft_token_ids", ())
+                    ):
+                        scheduled_ddtree_payloads[request_id] = ddtree_payload
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
                 request.spec_token_ids = []
+                self.ddtree_payloads_by_req_id.pop(request_id, None)
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -896,6 +1093,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
@@ -1699,6 +1897,7 @@ class Scheduler(SchedulerInterface):
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
+            self.ddtree_payloads_by_req_id.pop(req_id, None)
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request may have been finished. Skip.
@@ -1716,15 +1915,63 @@ class Scheduler(SchedulerInterface):
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = list(spec_token_ids)
 
+        if draft_token_ids.ddtree_payloads is None:
+            return
+
+        for req_id, ddtree_payload in zip(
+            draft_token_ids.req_ids,
+            draft_token_ids.ddtree_payloads,
+            strict=True,
+        ):
+            if ddtree_payload is None:
+                continue
+            request = self.requests.get(req_id)
+            if (
+                request is None
+                or request.is_finished()
+                or request.is_prefill_chunk
+                or not request.spec_token_ids
+            ):
+                _ddtree_debug_log(
+                    "payload store skipped req=%s request=%s finished=%s "
+                    "prefill_chunk=%s spec_len=%d",
+                    req_id,
+                    request is not None,
+                    request.is_finished() if request is not None else None,
+                    request.is_prefill_chunk if request is not None else None,
+                    len(request.spec_token_ids) if request is not None else 0,
+                )
+                continue
+            if tuple(request.spec_token_ids) == ddtree_payload.flat_draft_token_ids:
+                self.ddtree_payloads_by_req_id[req_id] = ddtree_payload
+                _ddtree_debug_log(
+                    "payload stored req=%s tree_len=%d flat_len=%d is_flat=%s",
+                    req_id,
+                    len(getattr(ddtree_payload, "tree_token_ids", ())),
+                    len(getattr(ddtree_payload, "flat_draft_token_ids", ())),
+                    self._ddtree_payload_is_flat_chain(ddtree_payload),
+                )
+            else:
+                _ddtree_debug_log(
+                    "payload store flat mismatch req=%s spec_len=%d flat_len=%d",
+                    req_id,
+                    len(request.spec_token_ids),
+                    len(getattr(ddtree_payload, "flat_draft_token_ids", ())),
+                )
+
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
         num_invalid_spec_tokens: dict[str, int] = {}
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
+        sched_ddtree_payloads = scheduler_output.scheduled_ddtree_payloads
+        for idx, (req_id, spec_token_ids) in enumerate(
+            zip(
+                draft_token_ids.req_ids,
+                draft_token_ids.draft_token_ids,
+                strict=True,
+            )
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -1733,6 +1980,27 @@ class Scheduler(SchedulerInterface):
 
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
             if not placeholder_spec_tokens:
+                continue
+
+            scheduled_ddtree_payload = (
+                sched_ddtree_payloads.get(req_id)
+                if sched_ddtree_payloads is not None
+                else None
+            )
+            if (
+                scheduled_ddtree_payload is not None
+                and tuple(placeholder_spec_tokens)
+                == getattr(scheduled_ddtree_payload, "tree_token_ids", ())
+            ):
+                # A branched DDTree verifier schedules more tree tokens than
+                # the flat DFlash draft row returned by the proposer. Keep the
+                # scheduled tree placeholders intact; replacing them with the
+                # flat row plus -1 padding would silently disable tree verify.
+                _ddtree_debug_log(
+                    "output update preserved tree req=%s spec_len=%d",
+                    req_id,
+                    len(placeholder_spec_tokens),
+                )
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
@@ -1753,6 +2021,30 @@ class Scheduler(SchedulerInterface):
                 num_invalid_spec_tokens[req_id] = num_invalid_tokens
 
             sched_spec_tokens[req_id] = spec_token_ids
+            if sched_ddtree_payloads is None:
+                continue
+
+            ddtree_payload = None
+            if draft_token_ids.ddtree_payloads is not None:
+                ddtree_payload = draft_token_ids.ddtree_payloads[idx]
+            if (
+                ddtree_payload is not None
+                and tuple(spec_token_ids) == ddtree_payload.flat_draft_token_ids
+            ):
+                sched_ddtree_payloads[req_id] = ddtree_payload
+                _ddtree_debug_log(
+                    "output update attached flat payload req=%s spec_len=%d",
+                    req_id,
+                    len(spec_token_ids),
+                )
+            else:
+                sched_ddtree_payloads.pop(req_id, None)
+                _ddtree_debug_log(
+                    "output update removed payload req=%s spec_len=%d has_payload=%s",
+                    req_id,
+                    len(spec_token_ids),
+                    ddtree_payload is not None,
+                )
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
 
@@ -1868,6 +2160,7 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
+        self.ddtree_payloads_by_req_id.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     @property

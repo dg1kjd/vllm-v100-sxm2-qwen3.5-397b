@@ -385,11 +385,8 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                 assert vllm_config.scheduler_config.enable_chunked_prefill, (
                     "Chunked prefill is required for mamba cache mode 'align'."
                 )
-            logger.info(
-                "Warning: Prefix caching in Mamba cache '%s' "
-                "mode is currently enabled. "
-                "Its support for Mamba layers is experimental. "
-                "Please report any issues you may observe.",
+            logger.info_once(
+                "Prefix caching is enabled with Mamba cache '%s' mode.",
                 cache_config.mamba_cache_mode,
             )
             # By default, mamba block size will be set to max_model_len (see

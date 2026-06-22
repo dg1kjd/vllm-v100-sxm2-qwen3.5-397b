@@ -38,6 +38,7 @@ GDN_SPEC_METADATA_TENSORS = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]
 _GDN_SPEC_METADATA_TENSOR_REGISTRY: dict[str, GDN_SPEC_METADATA_TENSORS] = {}
 
@@ -162,6 +163,9 @@ class GDNAttentionMetadata:
     non_spec_token_indx: torch.Tensor | None = None
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+    spec_state_slot_selectors: torch.Tensor | None = None  # shape: [batch,]
+    ddtree_parent_ids: torch.Tensor | None = None  # shape: [batch, tree_slots]
+    ddtree_num_tree_tokens_cpu: torch.Tensor | None = None  # shape: [batch,]
 
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
@@ -178,11 +182,13 @@ class GDNSpecDecodeStateContract:
     spec_state_indices_tensor: torch.Tensor
     non_spec_state_indices_tensor: torch.Tensor | None
     num_accepted_tokens: torch.Tensor
+    spec_state_slot_selectors: torch.Tensor
 
 
 def _empty_gdn_spec_metadata_tensors(
     device: torch.device,
 ) -> tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -202,6 +208,7 @@ def _empty_gdn_spec_metadata_tensors(
         empty_i32,
         empty_i32,
         empty_bool,
+        empty_i32,
         empty_i32,
     )
 
@@ -233,6 +240,11 @@ def gdn_spec_metadata_tensors(
             else empty_bool
         ),
         _or_empty_i32(attn_metadata.num_accepted_tokens),
+        _or_empty_i32(
+            attn_metadata.spec_state_slot_selectors
+            if attn_metadata.spec_state_slot_selectors is not None
+            else attn_metadata.num_accepted_tokens
+        ),
     )
 
 
@@ -299,13 +311,16 @@ def build_gdn_spec_decode_state_contract(
     num_accepted_tokens: torch.Tensor,
     current_state_block_ids: torch.Tensor | None,
     is_mamba_cache_all: bool,
+    spec_state_slot_selectors: torch.Tensor | None = None,
 ) -> GDNSpecDecodeStateContract:
     """Build the state-index/count contract consumed by active-MTP GDN.
 
     ``current_state_block_ids`` is authoritative for align-mode replay because
     it is materialized from the live ``mamba_state_idx`` after preprocess
-    rollover. The accepted count selects the committed speculative slot as
-    ``num_accepted_tokens - 1`` in the recurrent kernels.
+    rollover. The accepted count historically also selected the committed
+    speculative slot as ``num_accepted_tokens - 1`` in the recurrent kernels.
+    DDTree can accept a non-linear tree path, so callers may pass
+    ``spec_state_slot_selectors`` to select that slot independently.
     """
     assert spec_sequence_masks_cpu.dtype == torch.bool
     assert num_accepted_tokens is not None
@@ -318,6 +333,9 @@ def build_gdn_spec_decode_state_contract(
     block_mask = _mask_for(block_table_tensor)
     seq_mask = _mask_for(seq_lens)
     accepted_mask = _mask_for(num_accepted_tokens)
+    if spec_state_slot_selectors is None:
+        spec_state_slot_selectors = num_accepted_tokens
+    selector_mask = _mask_for(spec_state_slot_selectors)
 
     if current_state_block_ids is not None:
         current_mask = _mask_for(current_state_block_ids)
@@ -353,10 +371,16 @@ def build_gdn_spec_decode_state_contract(
         )
 
     spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
+    spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(
                 "GDN spec state contract mismatch: accepted-token rows do "
+                "not match spec state rows"
+            )
+        if spec_state_slot_selectors.numel() != spec_state_indices_tensor.shape[0]:
+            raise AssertionError(
+                "GDN spec state contract mismatch: state-selector rows do "
                 "not match spec state rows"
             )
         invalid_accept = (spec_num_accepted_tokens < 1) | (
@@ -368,13 +392,22 @@ def build_gdn_spec_decode_state_contract(
                 f"be in [1, {num_spec + 1}], got "
                 f"{spec_num_accepted_tokens.detach().cpu().tolist()}"
             )
+        invalid_selector = (spec_state_slot_selectors < 1) | (
+            spec_state_slot_selectors > num_spec + 1
+        )
+        if torch.any(invalid_selector).item():
+            raise AssertionError(
+                "GDN spec state contract mismatch: spec_state_slot_selectors "
+                f"must be in [1, {num_spec + 1}], got "
+                f"{spec_state_slot_selectors.detach().cpu().tolist()}"
+            )
         if spec_state_indices_tensor.numel() > 0:
             rows = torch.arange(
                 spec_state_indices_tensor.shape[0],
                 device=spec_state_indices_tensor.device,
                 dtype=torch.long,
             )
-            accepted_offsets = spec_num_accepted_tokens.to(
+            accepted_offsets = spec_state_slot_selectors.to(
                 device=spec_state_indices_tensor.device,
                 dtype=torch.long,
                 non_blocking=True,
@@ -402,6 +435,7 @@ def build_gdn_spec_decode_state_contract(
         spec_state_indices_tensor=spec_state_indices_tensor,
         non_spec_state_indices_tensor=non_spec_state_indices_tensor,
         num_accepted_tokens=spec_num_accepted_tokens,
+        spec_state_slot_selectors=spec_state_slot_selectors,
     )
 
 
@@ -435,8 +469,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
             self.num_spec: int = self.speculative_config.num_speculative_tokens
+            self.num_spec_state_tokens: int = (
+                self.speculative_config.num_speculative_state_tokens()
+            )
         else:
             self.num_spec = 0
+            self.num_spec_state_tokens = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
@@ -445,7 +483,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         self.decode_cudagraph_max_bs: int = (
-            self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
+            self.vllm_config.scheduler_config.max_num_seqs
+            * (self.num_spec_state_tokens + 1)
         )
         if self.compilation_config.max_cudagraph_capture_size is not None:
             self.decode_cudagraph_max_bs = min(
@@ -454,7 +493,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.num_spec_state_tokens + 1),
             dtype=torch.int32,
             device=device,
         )
@@ -469,12 +508,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device=device,
         )
         self.spec_token_indx: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs * (self.num_spec + 1),),
+            (self.decode_cudagraph_max_bs * (self.num_spec_state_tokens + 1),),
             dtype=torch.int32,
             device=device,
         )
         self.non_spec_token_indx: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs * (self.num_spec + 1),),
+            (self.decode_cudagraph_max_bs * (self.num_spec_state_tokens + 1),),
             dtype=torch.int32,
             device=device,
         )
@@ -493,9 +532,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.spec_state_slot_selectors: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int32,
+            device=device,
+        )
         if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
             placeholder_rows = max(
-                1, min(self.num_spec + 1, self.decode_cudagraph_max_bs)
+                1, min(self.num_spec_state_tokens + 1, self.decode_cudagraph_max_bs)
             )
             self.non_spec_query_start_loc[: placeholder_rows + 1].fill_(0)
             self.non_spec_state_indices_tensor[:placeholder_rows].fill_(PAD_SLOT_ID)
@@ -511,6 +555,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             self.non_spec_token_indx[:0].fill_(0)
             self.num_accepted_tokens[:placeholder_rows].fill_(1)
+            self.spec_state_slot_selectors[:placeholder_rows].fill_(1)
             register_gdn_spec_metadata_tensors(
                 self.layer_names,
                 (
@@ -522,6 +567,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     self.non_spec_token_indx[:0],
                     self.spec_sequence_masks[:placeholder_rows],
                     self.num_accepted_tokens[:placeholder_rows],
+                    self.spec_state_slot_selectors[:placeholder_rows],
                 ),
             )
 
@@ -530,9 +576,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         num_accepted_tokens: torch.Tensor | None = None,
+        spec_state_slot_selectors: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         spec_sequence_masks_cpu: torch.Tensor | None = None,
         current_state_block_ids: torch.Tensor | None = None,
+        ddtree_parent_ids: torch.Tensor | None = None,
+        ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
         for_cudagraph_capture: bool = False,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
@@ -567,6 +616,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert num_accepted_tokens.ndim == 1
             assert num_accepted_tokens.numel() == num_reqs, (
                 "num_accepted_tokens must align with query_start_loc"
+            )
+        if spec_state_slot_selectors is not None:
+            assert spec_state_slot_selectors.ndim == 1
+            assert spec_state_slot_selectors.numel() == num_reqs, (
+                "spec_state_slot_selectors must align with query_start_loc"
+            )
+        if ddtree_parent_ids is not None:
+            assert ddtree_parent_ids.ndim == 2
+            assert ddtree_parent_ids.shape[0] == num_reqs, (
+                "ddtree_parent_ids must align with query_start_loc"
+            )
+            assert ddtree_num_tree_tokens_cpu is not None
+            assert ddtree_num_tree_tokens_cpu.ndim == 1
+            assert ddtree_num_tree_tokens_cpu.numel() == num_reqs, (
+                "ddtree_num_tree_tokens_cpu must align with query_start_loc"
             )
 
         if not self.use_spec_decode:
@@ -626,7 +690,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 ).squeeze(1)
             else:
                 non_spec_state_indices_tensor = select_gdn_state_block_ids(
-                    block_table_tensor, num_accepted_tokens, self.num_spec
+                    block_table_tensor,
+                    num_accepted_tokens,
+                    self.num_spec_state_tokens,
                 )
             if num_prefills == 0:
                 query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
@@ -655,7 +721,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 and self.use_spec_decode
                 and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
             ):
-                placeholder_rows = min(self.num_spec + 1, self.decode_cudagraph_max_bs)
+                placeholder_rows = min(
+                    self.num_spec_state_tokens + 1,
+                    self.decode_cudagraph_max_bs,
+                )
                 self.spec_state_indices_tensor[:placeholder_rows].fill_(PAD_SLOT_ID)
                 spec_state_indices_tensor = self.spec_state_indices_tensor[
                     :placeholder_rows
@@ -688,11 +757,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 block_table_tensor=block_table_tensor,
                 seq_lens=m.seq_lens,
                 block_size=self.kv_cache_spec.block_size,
-                num_spec=self.num_spec,
+                num_spec=self.num_spec_state_tokens,
                 spec_sequence_masks_cpu=spec_sequence_masks_cpu,
                 num_accepted_tokens=num_accepted_tokens,
                 current_state_block_ids=current_state_block_ids,
                 is_mamba_cache_all=is_mamba_cache_all,
+                spec_state_slot_selectors=spec_state_slot_selectors,
             )
 
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
@@ -723,7 +793,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
+                    num_spec_decodes * (self.num_spec_state_tokens + 1),
                     query_start_loc_cpu[-1].item(),
                 )
                 spec_token_indx = torch.arange(
@@ -801,6 +871,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             num_accepted_tokens = state_contract.num_accepted_tokens
+            spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
             assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             assert spec_state_indices_tensor is not None
@@ -912,6 +983,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
+            self.spec_state_slot_selectors[:num_spec_decodes].copy_(
+                spec_state_slot_selectors, non_blocking=True
+            )
+            spec_state_slot_selectors = self.spec_state_slot_selectors[:batch_size]
+            spec_state_slot_selectors[num_spec_decodes:].fill_(1)
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
@@ -953,6 +1030,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            spec_state_slot_selectors=spec_state_slot_selectors,
+            ddtree_parent_ids=ddtree_parent_ids,
+            ddtree_num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
@@ -970,6 +1050,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dump_path = _dump_sm70_gdn_state_table(
                 {
                     "num_spec": self.num_spec,
+                    "num_spec_state_tokens": self.num_spec_state_tokens,
                     "layer_names": self.layer_names,
                     "use_full_cuda_graph": self.use_full_cuda_graph,
                     "decode_cudagraph_max_bs": self.decode_cudagraph_max_bs,
@@ -997,6 +1078,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     "non_spec_state_indices_tensor": _cpu(
                         non_spec_state_indices_tensor
                     ),
+                    "ddtree_parent_ids": _cpu(ddtree_parent_ids),
+                    "ddtree_num_tree_tokens_cpu": _cpu(
+                        ddtree_num_tree_tokens_cpu
+                    ),
                 },
                 m.seq_lens,
                 num_prefills,
@@ -1014,6 +1099,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dump_path = _dump_dflash_state_table(
                 {
                     "num_spec": self.num_spec,
+                    "num_spec_state_tokens": self.num_spec_state_tokens,
                     "layer_names": self.layer_names,
                     "use_full_cuda_graph": self.use_full_cuda_graph,
                     "decode_cudagraph_max_bs": self.decode_cudagraph_max_bs,
@@ -1039,6 +1125,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     "spec_state_indices_tensor": _cpu(spec_state_indices_tensor),
                     "non_spec_state_indices_tensor": _cpu(
                         non_spec_state_indices_tensor
+                    ),
+                    "ddtree_parent_ids": _cpu(ddtree_parent_ids),
+                    "ddtree_num_tree_tokens_cpu": _cpu(
+                        ddtree_num_tree_tokens_cpu
                     ),
                 }
             )
@@ -1070,10 +1160,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
 
         return self.build(
-            0,
-            m,
-            num_accepted_tokens,
-            num_decode_draft_tokens_cpu,
-            spec_sequence_masks_cpu,
+            common_prefix_len=0,
+            common_attn_metadata=m,
+            num_accepted_tokens=num_accepted_tokens,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
             for_cudagraph_capture=True,
         )

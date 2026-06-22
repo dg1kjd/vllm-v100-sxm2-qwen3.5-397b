@@ -142,6 +142,20 @@ void awq_gemm_sm70_out(torch::Tensor out,
                        int64_t q_ld,
                        bool gated_silu);
 
+void awq_gemm_sm70_out_tile_reduce(torch::Tensor out,
+                                   torch::Tensor staging,
+                                   torch::Tensor _in_feats,
+                                   torch::Tensor _kernel,
+                                   torch::Tensor _scaling_factors,
+                                   int64_t group_size,
+                                   int64_t k_ld,
+                                   int64_t q_ld,
+                                   int64_t fa_ptr,
+                                   int64_t tile_numel,
+                                   int64_t reducer_blocks,
+                                   int64_t kernel_reducer_blocks,
+                                   bool overlap);
+
 void fp8_gemm_sm70_out(torch::Tensor out,
                        torch::Tensor _in_feats,
                        torch::Tensor _kernel,
@@ -367,6 +381,7 @@ void awq_moe_single_token_sm70_out(
     torch::Tensor compact_input,
     torch::Tensor intermediate,
     torch::Tensor sorted_output,
+    torch::Tensor sorted_weights,
     torch::Tensor dst_w13_ptrs_w_rows,
     torch::Tensor dst_w13_ptrs_s_rows,
     torch::Tensor dst_w2_ptrs_w_rows,
@@ -549,6 +564,21 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                  fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
+                             fptr_t reg_buffer,
+                             int64_t reg_buffer_sz_bytes,
+                             int64_t tile_numel, int64_t engine_blocks,
+                             int64_t compute_iters);
+void tile_runtime_all_reduce_engine(fptr_t _fa, torch::Tensor& inp,
+                                    torch::Tensor& out, fptr_t reg_buffer,
+                                    int64_t reg_buffer_sz_bytes,
+                                    int64_t tile_numel,
+                                    int64_t producer_blocks,
+                                    int64_t reducer_blocks,
+                                    int64_t compute_iters);
+void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
+                              torch::Tensor& out, int64_t tile_numel,
+                              int64_t reducer_blocks);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);

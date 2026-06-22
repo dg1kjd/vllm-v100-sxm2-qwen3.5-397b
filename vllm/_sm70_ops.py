@@ -301,6 +301,59 @@ if hasattr(torch.ops._C, "awq_gemm_sm70_out"):
         return None
 
 
+def awq_gemm_sm70_out_tile_reduce(
+    out: torch.Tensor,
+    staging: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    fa_ptr: int,
+    tile_numel: int,
+    reducer_blocks: int,
+    kernel_reducer_blocks: int,
+    overlap: bool,
+) -> None:
+    _op("awq_gemm_sm70_out_tile_reduce")(
+        out,
+        staging,
+        input,
+        qweight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        fa_ptr,
+        tile_numel,
+        reducer_blocks,
+        kernel_reducer_blocks,
+        overlap,
+    )
+
+
+if hasattr(torch.ops._C, "awq_gemm_sm70_out_tile_reduce"):
+
+    @register_fake("_C::awq_gemm_sm70_out_tile_reduce")
+    def _awq_gemm_sm70_out_tile_reduce_fake(
+        out: torch.Tensor,
+        staging: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        fa_ptr: int,
+        tile_numel: int,
+        reducer_blocks: int,
+        kernel_reducer_blocks: int,
+        overlap: bool,
+    ) -> None:
+        return None
+
+
 def fp8_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1100,6 +1153,7 @@ def awq_moe_single_token_sm70_out(
     compact_input: torch.Tensor,
     intermediate: torch.Tensor,
     sorted_output: torch.Tensor,
+    sorted_weights: torch.Tensor,
     dst_w13_ptrs_w_rows: torch.Tensor,
     dst_w13_ptrs_s_rows: torch.Tensor,
     dst_w2_ptrs_w_rows: torch.Tensor,
@@ -1125,6 +1179,7 @@ def awq_moe_single_token_sm70_out(
         compact_input,
         intermediate,
         sorted_output,
+        sorted_weights,
         dst_w13_ptrs_w_rows,
         dst_w13_ptrs_s_rows,
         dst_w2_ptrs_w_rows,
@@ -1155,6 +1210,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_sm70_out"):
         compact_input: torch.Tensor,
         intermediate: torch.Tensor,
         sorted_output: torch.Tensor,
+        sorted_weights: torch.Tensor,
         dst_w13_ptrs_w_rows: torch.Tensor,
         dst_w13_ptrs_s_rows: torch.Tensor,
         dst_w2_ptrs_w_rows: torch.Tensor,

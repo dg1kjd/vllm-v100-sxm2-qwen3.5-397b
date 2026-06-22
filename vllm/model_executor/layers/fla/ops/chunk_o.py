@@ -206,7 +206,11 @@ def chunk_fwd_o(
         assert core_attn_out.numel() >= v.numel(), (
             f"core_attn_out too small: {core_attn_out.numel()} < {v.numel()}"
         )
-        o = core_attn_out[: v.numel()].view(*v.shape)
+        if not core_attn_out.is_contiguous():
+            raise RuntimeError(
+                "core_attn_out must be contiguous when reused by chunk_fwd_o"
+            )
+        o = core_attn_out.view(-1)[: v.numel()].view_as(v)
     else:
         o = torch.empty_like(v)
 

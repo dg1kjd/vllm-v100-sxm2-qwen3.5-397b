@@ -63,6 +63,8 @@ class SymmMemCommunicator:
             return
         self.device_capability = capability.as_version_str()
         if self.device_capability not in SYMM_MEM_ALL_REDUCE_MAX_SIZES:
+            if capability.major < 9:
+                return
             logger.warning(
                 "SymmMemCommunicator: Device capability %s not supported, "
                 "communicator is not available.",

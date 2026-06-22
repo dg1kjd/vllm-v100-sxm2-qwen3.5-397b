@@ -91,6 +91,19 @@ def test_sm70_flash_v100_priority_default_on(monkeypatch):
     assert AttentionBackendEnum.FLASH_ATTN not in backends
 
 
+def test_split_paged_kv_cache_prefers_standard_axis_for_two_blocks():
+    from vllm.v1.attention.backends.flash_attn_v100 import _split_paged_kv_cache
+
+    kv_cache = torch.empty((2, 2, 4, 1, 8), dtype=torch.float16)
+    kv_cache[:, 0].fill_(3)
+    kv_cache[:, 1].fill_(7)
+
+    key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+
+    assert torch.equal(key_cache, kv_cache[:, 0])
+    assert torch.equal(value_cache, kv_cache[:, 1])
+
+
 def test_sm70_flash_v100_priority_can_be_disabled(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FLASH_ATTN_V100", "0")
     _get_backend_priorities, DeviceCapability, AttentionBackendEnum = _load_selector()
@@ -475,7 +488,7 @@ def test_flash_v100_smallq_replay_shape_overflow_fails_fast(
     builder.build_for_cudagraph_capture(capture_common)
 
     runtime_common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[4], query_lens=[3]),
+        BatchSpec(seq_lens=[20], query_lens=[3]),
         block_size=16,
         device=torch.device("cpu"),
     )
@@ -649,6 +662,227 @@ def test_flash_v100_decode_forwards_shape_hints():
     assert torch.all(output == 1)
 
 
+def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    calls: list[str] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append("xqa")
+        kwargs["out"].fill_(1)
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("scalar decode should not be selected")
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
+
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([4097], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=4097,
+        flash_v100_decode_workspace_seq_capacity_hint=4097,
+        flash_v100_decode_active_num_partitions=torch.tensor([17], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    output = torch.zeros((1, 6, 256), dtype=torch.float16)
+    kv_cache = torch.zeros((2, 4, 16, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == ["xqa"]
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_decode_uses_xqa_for_qwen35_tp4_long_context(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
+
+    impl = FlashAttnV100Impl(
+        num_heads=4,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    calls: list[str] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append("xqa")
+        kwargs["out"].fill_(1)
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("scalar decode should not be selected")
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
+
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([32769], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=1,
+        flash_v100_decode_workspace_seq_capacity_hint=65536,
+        flash_v100_decode_active_num_partitions=torch.tensor([1], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, 4, 256), dtype=torch.float16)
+    output = torch.zeros((1, 4, 256), dtype=torch.float16)
+    kv_cache = torch.zeros((2, 4, 16, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == ["xqa"]
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_decode_keeps_qwen35_tp4_short_context_on_scalar(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", raising=False)
+
+    impl = FlashAttnV100Impl(
+        num_heads=4,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    calls: list[str] = []
+
+    def fail_xqa(*args, **kwargs):
+        raise AssertionError("q_per_kv=4 short-context decode should stay scalar")
+
+    def hit_scalar(*args, **kwargs):
+        calls.append("scalar")
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = fail_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
+
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([4097], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=4097,
+        flash_v100_decode_workspace_seq_capacity_hint=8192,
+        flash_v100_decode_active_num_partitions=torch.tensor([17], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, 4, 256), dtype=torch.float16)
+    output = torch.zeros((1, 4, 256), dtype=torch.float16)
+    kv_cache = torch.zeros((2, 4, 16, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == ["scalar"]
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_decode_xqa_default_can_be_disabled(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DECODE_USE_XQA", "0")
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    calls: list[str] = []
+
+    def fail_xqa(*args, **kwargs):
+        raise AssertionError("xqa decode should be disabled")
+
+    def hit_scalar(*args, **kwargs):
+        calls.append("scalar")
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = fail_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
+
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([4097], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=4097,
+        flash_v100_decode_workspace_seq_capacity_hint=4097,
+        flash_v100_decode_active_num_partitions=torch.tensor([17], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    output = torch.zeros((1, 6, 256), dtype=torch.float16)
+    kv_cache = torch.zeros((2, 4, 16, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == ["scalar"]
+    assert torch.all(output == 1)
+
+
 def test_flash_v100_smallq_capture_requires_persistent_metadata(monkeypatch):
     from vllm.v1.attention.backends import flash_attn_v100
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
@@ -694,3 +928,24 @@ def test_flash_v100_smallq_capture_requires_persistent_metadata(monkeypatch):
             attn_metadata.query_start_loc,
             attn_metadata.seq_lens,
         )
+
+
+def test_flash_v100_fp8_kv_route_summary_counts_repeated_hits(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "1")
+    monkeypatch.setattr(mod.atexit, "register", lambda callback: None)
+    monkeypatch.setattr(mod, "_route_counts", {})
+    monkeypatch.setattr(mod, "_route_summary_registered", False)
+    monkeypatch.setattr(mod, "_logged_fp8_kv_prefill", False)
+    monkeypatch.setattr(mod, "_logged_fp8_kv_decode", False)
+
+    mod._log_fp8_kv_cache_route("decode", "fp8_e5m2", "scalar_paged")
+    mod._log_fp8_kv_cache_route("decode", "fp8_e5m2", "scalar_paged")
+    mod._log_fp8_kv_cache_route("prefill", "fp8_e5m2", "prefix")
+    mod._log_fp8_kv_cache_route("decode", "auto", "scalar_paged")
+
+    assert mod._route_counts["fp8_kv_decode"] == 2
+    assert mod._route_counts["fp8_kv_decode_scalar_paged"] == 2
+    assert mod._route_counts["fp8_kv_prefill"] == 1
+    assert mod._route_counts["fp8_kv_prefill_prefix"] == 1

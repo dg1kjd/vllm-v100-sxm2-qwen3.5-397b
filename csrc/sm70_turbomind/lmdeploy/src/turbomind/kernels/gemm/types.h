@@ -127,6 +127,7 @@ enum class Epilogue : int
     kChannelCombination = 0x1,
     kGatedSilu          = 0x2,
     kMoeWeightedReduce  = 0x4,
+    kTileAllReduce      = 0x8,
 };
 
 struct QuantDesc {
@@ -193,12 +194,29 @@ struct Operation {
     int            dispatch_num_override;
     int            active_group_count;
     void*          reserved;
+    void*          tile_allreduce;
 };
 
 struct MoeWeightedReduceParam {
     void*        out;
     const float* sorted_weights;
     const int*   offsets;
+};
+
+struct TileAllReduceParam {
+    void* signals[8];
+    void* self_signal;
+    void* rank_data;
+    void* output;
+    int   rank;
+    int   world_size;
+    int   tile_numel;
+    int   output_numel;
+    int   reducer_blocks;
+    int   kernel_reducer_blocks;
+    int   producer_grid_x;
+    int   producer_grid_y;
+    int   producer_grid_z;
 };
 
 inline Operation transpose(Operation o)

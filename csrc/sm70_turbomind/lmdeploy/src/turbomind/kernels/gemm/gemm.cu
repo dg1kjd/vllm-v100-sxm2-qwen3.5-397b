@@ -19,6 +19,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace turbomind::gemm {
@@ -56,6 +57,96 @@ bool GemmTraceFilterAllows(const std::string& desc)
 {
     const char* raw = std::getenv("TM_GEMM_TRACE_FILTER");
     return !raw || !*raw || desc.find(raw) != std::string::npos;
+}
+
+bool Sm70AwqTp2FastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
+}
+
+struct Sm70AwqTp2FastTarget {
+    int  n;
+    int  k;
+    int  cta_m;
+    int  cta_n;
+    int  cta_k;
+    int  splits;
+    int  swizzle;
+    bool require_mgroup;
+};
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc)
+{
+    if (!Sm70AwqTp2FastSelectorEnabled()) {
+        return std::nullopt;
+    }
+    const std::string desc_str = to_string(desc);
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 3, 3, false};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 7, 0, false};
+    }
+    return std::nullopt;
+}
+
+bool MatchesSm70AwqTp2FastKernel(const Kernel& kernel, const Sm70AwqTp2FastTarget& target)
+{
+    const int3 cta = kernel.cta_tile_size();
+    if (cta.x != target.cta_m || cta.y != target.cta_n || cta.z != target.cta_k) {
+        return false;
+    }
+    const std::string name = kernel.name();
+    const bool        is_mgroup = name.find("mgroup") != std::string::npos;
+    return is_mgroup == target.require_mgroup;
+}
+
+void MaybeTraceSm70AwqTp2FastSelector(const GemmDesc& desc, const char* stage, const LaunchSpec* spec = nullptr)
+{
+    if (!GemmTraceEnabled()) {
+        return;
+    }
+    const std::string desc_str = to_string(desc);
+    if (!GemmTraceFilterAllows(desc_str)) {
+        return;
+    }
+    std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str << " stage=" << stage;
+    if (spec && spec->kernel) {
+        std::cerr << " kernel=" << spec->kernel->name() << " splits=" << spec->splits
+                  << " swizzle=" << spec->swizzle;
+    }
+    std::cerr << std::endl;
+}
+
+std::optional<LaunchSpec> SelectSm70AwqTp2FastSpec(Context&                              ctx,
+                                                   const std::vector<LaunchSpec>&        specs,
+                                                   const Sm70AwqTp2FastTarget&           target,
+                                                   size_t                                barriers_size,
+                                                   size_t                                partials_size)
+{
+    for (const auto& spec : specs) {
+        if (!spec.kernel || !MatchesSm70AwqTp2FastKernel(*spec.kernel, target)) {
+            continue;
+        }
+        if (spec.splits != target.splits) {
+            continue;
+        }
+        auto selected = spec;
+        const auto& actual_desc = ctx.get_desc(*selected.kernel);
+        const int4  shape{actual_desc.m, actual_desc.n, actual_desc.k, actual_desc.num};
+        if (target.swizzle > selected.kernel->GetMaxSwizzle(shape)) {
+            continue;
+        }
+        (void)barriers_size;
+        (void)partials_size;
+        selected.splits  = target.splits;
+        selected.swizzle = target.swizzle;
+        MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "selected", &selected);
+        return selected;
+    }
+    MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "no_match");
+    return std::nullopt;
 }
 
 const char* ToString(DispatchPolicy policy)
@@ -175,10 +266,18 @@ struct Gemm::Impl {
             return *spec;
         }
 
-        auto specs = Find(ctx, barriers_size, partials_size, 1);
+        const auto fast_target = GetSm70AwqTp2FastTarget(desc);
+        auto specs = Find(ctx, barriers_size, partials_size, fast_target ? 0 : 1);
         if (!specs.empty()) {
-            cache_.Insert(desc, specs.front());
-            return specs.front();
+            auto selected = specs.front();
+            if (fast_target) {
+                if (auto fast_spec =
+                        SelectSm70AwqTp2FastSpec(ctx, specs, *fast_target, barriers_size, partials_size)) {
+                    selected = *fast_spec;
+                }
+            }
+            cache_.Insert(desc, selected);
+            return selected;
         }
         return {};
     }

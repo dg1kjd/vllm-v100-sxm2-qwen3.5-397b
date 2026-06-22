@@ -18,10 +18,12 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 else:
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
+    DDTreeDraftPayload = object
 
 
 class LogprobsLists(NamedTuple):
@@ -190,6 +192,8 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # Optional DDTree accepted compact node indices, padded with -1.
+    ddtree_accepted_node_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -313,6 +317,8 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
+    # Optional per-request DDTree payloads aligned with req_ids.
+    ddtree_payloads: list[DDTreeDraftPayload | None] | None = None
 
 
 def make_empty_encoder_model_runner_output(

@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -137,6 +137,8 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100MetadataBuilder
+from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -182,6 +184,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
+from vllm.v1.spec_decode.ddtree_parent_metadata import (
+    DDTreeParentMetadata,
+    build_padded_parent_ids,
+)
+from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
+from vllm.v1.spec_decode.ddtree_sampler import greedy_sample_ddtree_payloads
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.draft_prob_alignment import (
@@ -245,6 +253,15 @@ _SM70_SAMPLE_SYNC_COUNTER = 0
 _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER = 0
 _SM70_MTP_STEP_DUMP_COUNTER = 0
 _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = False
+
+
+def _dflash_ddtree_debug_enabled() -> bool:
+    return os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0") == "1"
+
+
+def _dflash_ddtree_debug_log(message: str, *args: object) -> None:
+    if _dflash_ddtree_debug_enabled():
+        logger.info("DFlash DDTree runner debug: " + message, *args)
 
 
 def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
@@ -919,6 +936,7 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    slot_mappings_by_group: dict[int, torch.Tensor] | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
@@ -1070,7 +1088,7 @@ class GPUModelRunner(
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
         self.max_spec_state_slots = 1 + (
-            self.speculative_config.num_speculative_tokens
+            self.speculative_config.num_speculative_state_tokens()
             if self.speculative_config is not None
             else 0
         )
@@ -1395,6 +1413,9 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        self.spec_state_slot_selectors = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
         self.current_mamba_state_block_ids = self._make_buffer(
             self.max_num_reqs,
             self.max_spec_state_slots,
@@ -1472,6 +1493,8 @@ class GPUModelRunner(
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
         self._draft_prob_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._dflash_ddtree_payloads: tuple[DDTreeDraftPayload, ...] | None = None
+        self._ddtree_parent_metadata: DDTreeParentMetadata | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -2222,7 +2245,10 @@ class GPUModelRunner(
             return None
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
+        self,
+        output_token_ids: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+        ddtree_accepted_node_indices: torch.Tensor | None = None,
     ) -> None:
         """Update the cached states after model execution.
 
@@ -2238,9 +2264,21 @@ class GPUModelRunner(
         # Count only the contiguous accepted prefix. Values after the first -1
         # are rejected/padding slots and may contain stale token ids.
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = _count_contiguous_spec_tokens(
+        num_accepted_tokens = _count_contiguous_spec_tokens(
             output_token_ids
         )
+        spec_state_slot_selectors = num_accepted_tokens
+        if (
+            ddtree_accepted_node_indices is not None
+            and scheduler_output.scheduled_ddtree_payloads
+        ):
+            spec_state_slot_selectors = (
+                self._ddtree_state_slot_selectors_from_accepted_nodes(
+                    ddtree_accepted_node_indices
+                )
+            )
+        self.num_accepted_tokens.gpu[:num_reqs] = num_accepted_tokens
+        self.spec_state_slot_selectors.gpu[:num_reqs] = spec_state_slot_selectors
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: stage this step's metadata immediately
@@ -2253,7 +2291,7 @@ class GPUModelRunner(
                     self.num_accepted_tokens.gpu[:num_reqs]
                 )
                 self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                    self.num_accepted_tokens.gpu[:num_reqs]
+                    self.spec_state_slot_selectors.gpu[:num_reqs]
                 )
                 mamba_utils.postprocess_mamba(
                     scheduler_output,
@@ -2267,7 +2305,8 @@ class GPUModelRunner(
                 )
             else:
                 self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                    self.spec_state_slot_selectors.gpu[:num_reqs],
+                    non_blocking=True,
                 )
                 mamba_utils.stage_postprocess_inputs_to_gpu(
                     mamba_bufs.postprocess_align,
@@ -2281,6 +2320,9 @@ class GPUModelRunner(
                     bufs=mamba_bufs,
                     num_reqs=num_reqs,
                     num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                    spec_state_slot_selectors_gpu=(
+                        self.spec_state_slot_selectors.gpu
+                    ),
                     num_accepted_tokens_cpu_tensor=(
                         self.input_batch.num_accepted_tokens_cpu_tensor
                     ),
@@ -2291,6 +2333,11 @@ class GPUModelRunner(
                     kv_cache_config=self.kv_cache_config,
                     forward_context=self.compilation_config.static_forward_context,
                     mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                    ddtree_accepted_node_indices=(
+                        ddtree_accepted_node_indices
+                        if scheduler_output.scheduled_ddtree_payloads
+                        else None
+                    ),
                 )
 
             assert self.num_accepted_tokens_event is not None
@@ -2300,7 +2347,7 @@ class GPUModelRunner(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
             self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                self.spec_state_slot_selectors.gpu[:num_reqs], non_blocking=True
             )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
@@ -2315,6 +2362,281 @@ class GPUModelRunner(
                     self.num_spec_tokens,
                     num_reqs,
                 )
+
+    @staticmethod
+    def _ddtree_accepted_kv_local_copies(
+        *,
+        req_ids: Sequence[str],
+        num_scheduled_tokens: Mapping[str, int],
+        scheduled_spec_decode_tokens: Mapping[str, Sequence[int]],
+        accepted_node_indices: torch.Tensor,
+    ) -> list[tuple[int, int]]:
+        if accepted_node_indices.ndim != 2:
+            raise ValueError("accepted_node_indices must have shape [reqs, accepted]")
+        copies: list[tuple[int, int]] = []
+        req_start = 0
+        accepted_cpu = accepted_node_indices.detach().cpu()
+        for req_idx, req_id in enumerate(req_ids):
+            req_num_tokens = int(num_scheduled_tokens.get(req_id, 0))
+            draft_len = len(scheduled_spec_decode_tokens.get(req_id, ()))
+            if req_num_tokens <= 0:
+                continue
+            if draft_len <= 0 or req_num_tokens < draft_len + 1:
+                req_start += req_num_tokens
+                continue
+            sample_start = req_start + req_num_tokens - draft_len - 1
+            for accepted_pos, raw_node_idx in enumerate(accepted_cpu[req_idx].tolist()):
+                node_idx = int(raw_node_idx)
+                if node_idx < 1:
+                    break
+                if node_idx > draft_len:
+                    break
+                src_local = sample_start + node_idx
+                dst_local = sample_start + 1 + accepted_pos
+                if src_local != dst_local:
+                    copies.append((src_local, dst_local))
+            req_start += req_num_tokens
+        return copies
+
+    @staticmethod
+    def _ddtree_accepted_nodes_are_flat_prefix(
+        accepted_node_indices: torch.Tensor,
+    ) -> bool:
+        if accepted_node_indices.ndim != 2:
+            raise ValueError("accepted_node_indices must have shape [reqs, accepted]")
+        accepted_cpu = accepted_node_indices.detach().cpu()
+        for row in accepted_cpu.tolist():
+            expected_node_idx = 1
+            for raw_node_idx in row:
+                node_idx = int(raw_node_idx)
+                if node_idx < 1:
+                    break
+                if node_idx != expected_node_idx:
+                    return False
+                expected_node_idx += 1
+        return True
+
+    @staticmethod
+    def _ddtree_state_slot_selectors_from_accepted_nodes(
+        accepted_node_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return DDTree recurrent-state selector values per request.
+
+        Existing hybrid kernels interpret ``num_accepted_tokens - 1`` as the
+        speculative state slot to continue from. For a DDTree path this slot is
+        the last accepted compact node index, not the accepted-token count.
+        """
+        if accepted_node_indices.ndim != 2:
+            raise ValueError("accepted_node_indices must have shape [reqs, accepted]")
+        if accepted_node_indices.shape[1] == 0:
+            return torch.ones(
+                accepted_node_indices.shape[0],
+                dtype=torch.int32,
+                device=accepted_node_indices.device,
+            )
+        accepted_or_zero = torch.where(
+            accepted_node_indices >= 1,
+            accepted_node_indices,
+            torch.zeros_like(accepted_node_indices),
+        )
+        last_node_indices = accepted_or_zero.max(dim=1).values
+        return (last_node_indices + 1).to(torch.int32)
+
+    @staticmethod
+    def _ddtree_payload_is_flat_chain(payload: object) -> bool:
+        is_flat_chain = getattr(payload, "is_flat_chain", None)
+        if callable(is_flat_chain):
+            return bool(is_flat_chain())
+        flat = tuple(getattr(payload, "flat_draft_token_ids", ()))
+        tree = tuple(getattr(payload, "tree_token_ids", ()))
+        parents = tuple(getattr(payload, "parent_indices", ()))
+        depths = tuple(getattr(payload, "node_depths", ()))
+        num_nodes = len(tree)
+        expected_parents = () if num_nodes == 0 else (-1,) + tuple(range(num_nodes - 1))
+        expected_depths = tuple(range(1, num_nodes + 1))
+        return (
+            tree == flat
+            and parents == expected_parents
+            and depths == expected_depths
+        )
+
+    @classmethod
+    def _ddtree_scheduled_payloads_require_hybrid_tree_state(
+        cls,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        return any(
+            not cls._ddtree_payload_is_flat_chain(payload)
+            for payload in scheduler_output.scheduled_ddtree_payloads.values()
+        )
+
+    def _validate_ddtree_hybrid_state_path(
+        self,
+        sampler_output: SamplerOutput,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        if (
+            not self.model_config.is_hybrid
+            or sampler_output.ddtree_accepted_node_indices is None
+            or not scheduler_output.scheduled_ddtree_payloads
+            or not self._ddtree_scheduled_payloads_require_hybrid_tree_state(
+                scheduler_output
+            )
+        ):
+            return
+
+        accepted_path = (
+            "flat-prefix"
+            if self._ddtree_accepted_nodes_are_flat_prefix(
+                sampler_output.ddtree_accepted_node_indices
+            )
+            else "branched"
+        )
+        if os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0") == "1":
+            return
+        raise RuntimeError(
+            "Branched DDTree verification for hybrid models requires "
+            "tree-aware GDN/Mamba parent-state computation and accepted-path "
+            "state commit before the recurrent state update. "
+            f"Observed accepted path: {accepted_path}."
+        )
+
+    @staticmethod
+    def _copy_attention_kv_slot(
+        kv_cache: torch.Tensor,
+        *,
+        src_slot: int,
+        dst_slot: int,
+        block_size: int,
+    ) -> None:
+        if src_slot < 0 or dst_slot < 0 or src_slot == dst_slot:
+            return
+        if (
+            kv_cache.ndim < 5
+            or kv_cache.shape[1] != 2
+            or kv_cache.shape[2] != block_size
+        ):
+            return
+        src_block, src_offset = divmod(src_slot, block_size)
+        dst_block, dst_offset = divmod(dst_slot, block_size)
+        kv_cache[dst_block, :, dst_offset].copy_(
+            kv_cache[src_block, :, src_offset].clone()
+        )
+
+    def _compact_ddtree_accepted_attention_kv(
+        self,
+        sampler_output: SamplerOutput,
+        scheduler_output: "SchedulerOutput",
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+    ) -> None:
+        accepted_node_indices = sampler_output.ddtree_accepted_node_indices
+        if (
+            accepted_node_indices is None
+            or not scheduler_output.scheduled_ddtree_payloads
+            or slot_mappings_by_group is None
+        ):
+            return
+
+        copies = self._ddtree_accepted_kv_local_copies(
+            req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            scheduled_spec_decode_tokens=(
+                scheduler_output.scheduled_spec_decode_tokens
+            ),
+            accepted_node_indices=accepted_node_indices,
+        )
+        if not copies:
+            return
+
+        forward_context = self.compilation_config.static_forward_context
+        seen_cache_ptrs: set[int] = set()
+        for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            slot_mapping = slot_mappings_by_group.get(kv_cache_gid)
+            if slot_mapping is None:
+                continue
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                continue
+            block_size = kv_cache_spec.block_size
+            for layer_name in kv_cache_group.layer_names:
+                attention = forward_context.get(layer_name)
+                kv_cache = None if attention is None else attention.kv_cache
+                if not isinstance(kv_cache, torch.Tensor):
+                    continue
+                data_ptr = kv_cache.data_ptr()
+                if data_ptr in seen_cache_ptrs:
+                    continue
+                seen_cache_ptrs.add(data_ptr)
+                for src_local, dst_local in copies:
+                    if (
+                        src_local >= slot_mapping.numel()
+                        or dst_local >= slot_mapping.numel()
+                    ):
+                        continue
+                    src_slot = int(slot_mapping[src_local].item())
+                    dst_slot = int(slot_mapping[dst_local].item())
+                    self._copy_attention_kv_slot(
+                        kv_cache,
+                        src_slot=src_slot,
+                        dst_slot=dst_slot,
+                        block_size=block_size,
+                    )
+
+    def _compact_ddtree_drafter_context(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        sampler_output: SamplerOutput,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Compact DDTree branch hidden states before the next DFlash draft."""
+        if not envs.VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT:
+            return
+        accepted_node_indices = sampler_output.ddtree_accepted_node_indices
+        if (
+            accepted_node_indices is None
+            or not scheduler_output.scheduled_ddtree_payloads
+            or not isinstance(hidden_states, torch.Tensor)
+        ):
+            return
+
+        copies = self._ddtree_accepted_kv_local_copies(
+            req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            scheduled_spec_decode_tokens=(
+                scheduler_output.scheduled_spec_decode_tokens
+            ),
+            accepted_node_indices=accepted_node_indices,
+        )
+        if not copies:
+            return
+
+        tensors: list[torch.Tensor] = [hidden_states]
+        if aux_hidden_states is not None:
+            tensors.extend(
+                tensor for tensor in aux_hidden_states
+                if isinstance(tensor, torch.Tensor)
+            )
+
+        copied = 0
+        for src_local, dst_local in copies:
+            for tensor in tensors:
+                if src_local < tensor.shape[0] and dst_local < tensor.shape[0]:
+                    tensor[dst_local].copy_(tensor[src_local].clone())
+            if (
+                src_local < self.input_ids.gpu.shape[0]
+                and dst_local < self.input_ids.gpu.shape[0]
+            ):
+                self.input_ids.gpu[dst_local].copy_(self.input_ids.gpu[src_local])
+            copied += 1
+
+        _dflash_ddtree_debug_log(
+            "compacted drafter context copies=%d pairs=%s",
+            copied,
+            copies[:8],
+        )
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -2462,6 +2784,53 @@ class GPUModelRunner(
 
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
+
+    def _apply_ddtree_position_overrides(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        payloads = scheduler_output.scheduled_ddtree_payloads
+        if not payloads or self.uses_mrope or self.uses_xdrope_dim > 0:
+            return
+
+        req_starts = np.empty(num_reqs, dtype=np.int64)
+        req_starts[0] = 0
+        if num_reqs > 1:
+            req_starts[1:] = cu_num_tokens[:-1]
+
+        for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            payload = payloads.get(req_id)
+            if payload is None or not payload.tree_token_ids:
+                continue
+            scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(
+                req_id,
+                (),
+            )
+            if tuple(scheduled_spec_tokens) != tuple(payload.tree_token_ids):
+                continue
+
+            draft_len = len(scheduled_spec_tokens)
+            req_num_tokens = int(num_scheduled_tokens[req_idx])
+            if draft_len <= 0 or req_num_tokens < draft_len + 1:
+                continue
+
+            sample_start = int(req_starts[req_idx] + req_num_tokens - draft_len - 1)
+            tree_start = sample_start + 1
+            tree_end = tree_start + len(payload.node_depths)
+            if tree_end > int(cu_num_tokens[req_idx]):
+                continue
+
+            depths = torch.tensor(
+                payload.node_depths,
+                dtype=torch.int64,
+                device=self.positions.device,
+            )
+            self.positions[tree_start:tree_end].copy_(
+                self.positions[sample_start].to(torch.int64) + depths
+            )
 
     def _prepare_input_ids(
         self,
@@ -2683,6 +3052,20 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        self._ddtree_parent_metadata = None
+        spec_config = self.speculative_config
+        if (
+            spec_config is not None
+            and spec_config.use_dflash_ddtree()
+            and not spec_config.ddtree_disable_tree_verify
+        ):
+            ddtree_budget = spec_config.ddtree_budget or self.num_spec_tokens
+            self._ddtree_parent_metadata = build_padded_parent_ids(
+                self.input_batch.req_ids[:num_reqs],
+                scheduler_output.scheduled_ddtree_payloads,
+                device=self.device,
+                pad_to=ddtree_budget + 1,
+            )
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -2839,17 +3222,25 @@ class GPUModelRunner(
                 spec_counts = spec_counts.copy()
                 spec_counts[new_mask] = 1
                 self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs] = spec_counts
-                self.num_accepted_tokens.np[:num_reqs] = spec_counts
+                self.num_accepted_tokens.np[:num_reqs] = align_counts
+                self.spec_state_slot_selectors.np[:num_reqs] = spec_counts
             else:
                 # Non-async mode: use values directly
                 self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                )
+                self.spec_state_slot_selectors.np[:num_reqs] = (
                     self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs]
                 )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
+            self.spec_state_slot_selectors.np[num_reqs:].fill(1)
             self._copy_buffer_to_gpu(self.num_accepted_tokens)
+            self._copy_buffer_to_gpu(self.spec_state_slot_selectors)
         else:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
+            self.spec_state_slot_selectors.np.fill(1)
+            self.spec_state_slot_selectors.gpu.fill_(1)
 
         if self.mamba_prev_last_scheduled_idx is not None:
             mamba_utils.preprocess_mamba_all_specdec(
@@ -2909,6 +3300,12 @@ class GPUModelRunner(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
+        )
+        self._apply_ddtree_position_overrides(
+            scheduler_output,
+            num_reqs,
+            num_scheduled_tokens,
+            cu_num_tokens,
         )
 
         # Copy the tensors to the GPU.
@@ -3007,6 +3404,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        ddtree_parent_metadata: DDTreeParentMetadata | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3033,10 +3431,17 @@ class GPUModelRunner(
 
         if use_spec_decode:
             self.num_accepted_tokens.np[:num_reqs] = (
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            )
+            self.spec_state_slot_selectors.np[:num_reqs] = (
                 self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs]
             )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
+            self.spec_state_slot_selectors.np[num_reqs:].fill(1)
             self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs_padded)
+            self._copy_buffer_to_gpu(
+                self.spec_state_slot_selectors, num_reqs_padded
+            )
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -3205,6 +3610,20 @@ class GPUModelRunner(
                         :num_reqs_padded
                     ],
                 )
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    extra_attn_metadata_args["spec_state_slot_selectors"] = (
+                        self.spec_state_slot_selectors.gpu[:num_reqs_padded]
+                    )
+                if (
+                    ddtree_parent_metadata is not None
+                    and isinstance(builder, GDNAttentionMetadataBuilder)
+                ):
+                    extra_attn_metadata_args["ddtree_parent_ids"] = (
+                        ddtree_parent_metadata.parent_ids
+                    )
+                    extra_attn_metadata_args["ddtree_num_tree_tokens_cpu"] = (
+                        ddtree_parent_metadata.num_tree_tokens_cpu
+                    )
                 if (
                     isinstance(builder, Mamba2AttentionMetadataBuilder)
                     and self.mamba_prev_last_scheduled_idx is not None
@@ -3219,6 +3638,20 @@ class GPUModelRunner(
                     extra_attn_metadata_args["current_state_block_ids"] = (
                         _get_current_mamba_state_block_ids(kv_cache_gid)
                     )
+            elif (
+                use_spec_decode
+                and isinstance(
+                    builder,
+                    (FlexAttentionMetadataBuilder, FlashAttnV100MetadataBuilder),
+                )
+                and ddtree_parent_metadata is not None
+            ):
+                extra_attn_metadata_args = dict(
+                    ddtree_parent_ids=ddtree_parent_metadata.parent_ids,
+                    ddtree_num_tree_tokens_cpu=(
+                        ddtree_parent_metadata.num_tree_tokens_cpu
+                    ),
+                )
 
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
@@ -4428,8 +4861,49 @@ class GPUModelRunner(
         metadata["sample_input_ids"] = self.input_ids.gpu[logits_indices].detach().cpu()
         return metadata
 
+    @staticmethod
+    def _ddtree_greedy_sampling_supported(
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        if not sampling_metadata.all_greedy:
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if sampling_metadata.logprob_token_ids:
+            return False
+        if not sampling_metadata.no_penalties:
+            return False
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return False
+        if sampling_metadata.bad_words_token_ids:
+            return False
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        logitsprocs = sampling_metadata.logitsprocs
+        if not logitsprocs.non_argmax_invariant:
+            return True
+
+        from vllm.v1.sample.logits_processor.builtin import (
+            LogitBiasLogitsProcessor,
+            MinTokensLogitsProcessor,
+        )
+
+        for processor in logitsprocs.non_argmax_invariant:
+            if isinstance(processor, LogitBiasLogitsProcessor):
+                if processor.biases:
+                    return False
+                continue
+            if isinstance(processor, MinTokensLogitsProcessor):
+                if processor.min_toks:
+                    return False
+                continue
+            return False
+        return True
+
     def _sample(
         self,
+        scheduler_output: "SchedulerOutput",
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         sample_hidden_states: torch.Tensor,
@@ -4462,6 +4936,69 @@ class GPUModelRunner(
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
+            )
+
+        if logits is None:
+            logits = self.model.compute_logits(sample_hidden_states)
+        assert logits is not None
+
+        spec_config = self.speculative_config
+        if (
+            spec_config is not None
+            and spec_config.use_dflash_ddtree()
+            and not spec_config.ddtree_disable_tree_verify
+            and scheduler_output.scheduled_ddtree_payloads
+            and self._ddtree_greedy_sampling_supported(sampling_metadata)
+        ):
+            ddtree_result = greedy_sample_ddtree_payloads(
+                req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
+                payload_by_req_id=scheduler_output.scheduled_ddtree_payloads,
+                compact_logits=logits,
+                num_draft_tokens=spec_decode_metadata.num_draft_tokens,
+            )
+            if ddtree_result is not None:
+                if _dflash_ddtree_debug_enabled():
+                    first_result = (
+                        ddtree_result.verification_results[0]
+                        if ddtree_result.verification_results
+                        else None
+                    )
+                    _dflash_ddtree_debug_log(
+                        "greedy sampler used reqs=%d first_accepted=%s "
+                        "first_output=%s",
+                        len(ddtree_result.verification_results),
+                        None
+                        if first_result is None
+                        else first_result.accepted_node_indices,
+                        None
+                        if first_result is None
+                        else first_result.output_token_ids,
+                    )
+                return ddtree_result.sampler_output
+            _dflash_ddtree_debug_log(
+                "greedy sampler returned None reqs=%d logits_rows=%d "
+                "num_draft_tokens=%s payloads=%d",
+                self.input_batch.num_reqs,
+                logits.shape[0],
+                list(spec_decode_metadata.num_draft_tokens),
+                len(scheduler_output.scheduled_ddtree_payloads),
+            )
+        elif (
+            spec_config is not None
+            and spec_config.use_dflash_ddtree()
+            and not spec_config.ddtree_disable_tree_verify
+            and scheduler_output.scheduled_ddtree_payloads
+        ):
+            _dflash_ddtree_debug_log(
+                "greedy sampler unsupported all_greedy=%s max_logprobs=%s "
+                "logprob_token_ids=%s no_penalties=%s allowed_mask=%s "
+                "bad_words=%s",
+                sampling_metadata.all_greedy,
+                sampling_metadata.max_num_logprobs,
+                bool(sampling_metadata.logprob_token_ids),
+                sampling_metadata.no_penalties,
+                sampling_metadata.allowed_token_ids_mask is not None,
+                bool(sampling_metadata.bad_words_token_ids),
             )
 
         # Update spec_token_ids with real draft tokens from pre step only when
@@ -5415,6 +5952,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    ddtree_parent_metadata=self._ddtree_parent_metadata,
                 )
             )
             if trace_log:
@@ -5623,6 +6161,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            slot_mappings_by_group,
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
@@ -5664,12 +6203,12 @@ class GPUModelRunner(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE and self.use_async_scheduling
-        trace_step = self._sm70_async_worker_sample_trace_step
+        trace_step = getattr(self, "_sm70_async_worker_sample_trace_step", 0)
         trace_log = trace_enabled and (
             trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
         )
         if trace_enabled:
-            self._sm70_async_worker_sample_trace_step += 1
+            self._sm70_async_worker_sample_trace_step = trace_step + 1
         trace_t0 = time.perf_counter() if trace_log else 0.0
         trace_wait_hidden_ms = 0.0
         trace_logits_ms = 0.0
@@ -5710,6 +6249,7 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            slot_mappings_by_group,
             slot_mappings,
         ) = self.execute_model_state
         # Clear ephemeral state.
@@ -5745,6 +6285,7 @@ class GPUModelRunner(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"]
             )
             sampler_output = self._sample(
+                scheduler_output,
                 logits,
                 spec_decode_metadata,
                 sample_hidden_states,
@@ -5761,8 +6302,25 @@ class GPUModelRunner(
                 trace_sample_ms = (time.perf_counter() - trace_sample_t0) * 1000.0
 
         trace_state_update_t0 = time.perf_counter() if trace_log else 0.0
+        self._validate_ddtree_hybrid_state_path(
+            sampler_output,
+            scheduler_output,
+        )
+        self._compact_ddtree_accepted_attention_kv(
+            sampler_output,
+            scheduler_output,
+            slot_mappings_by_group,
+        )
         self._update_states_after_model_execute(
-            sampler_output.sampled_token_ids, scheduler_output
+            sampler_output.sampled_token_ids,
+            scheduler_output,
+            sampler_output.ddtree_accepted_node_indices,
+        )
+        self._compact_ddtree_drafter_context(
+            hidden_states,
+            aux_hidden_states,
+            sampler_output,
+            scheduler_output,
         )
         if self.use_async_scheduling:
             pp = get_pp_group()
@@ -5778,6 +6336,8 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_prob_token_ids = None
+        self._dflash_ddtree_payloads = None
+        self._ddtree_parent_metadata = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -6112,9 +6672,40 @@ class GPUModelRunner(
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
+            _dflash_ddtree_debug_log(
+                "take draft none num_spec=%s req_ids=%s payloads=%s",
+                self.num_spec_tokens,
+                len(self._draft_token_req_ids)
+                if self._draft_token_req_ids is not None
+                else None,
+                self._dflash_ddtree_payloads is not None,
+            )
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
-        return DraftTokenIds(req_ids, draft_token_ids)
+        ddtree_payloads = None
+        if self._dflash_ddtree_payloads is not None:
+            payloads = list(self._dflash_ddtree_payloads)
+            ddtree_payloads = [
+                payloads[idx] if idx < len(payloads) else None
+                for idx in range(len(req_ids))
+            ]
+        _dflash_ddtree_debug_log(
+            "take draft reqs=%d rows=%d payload_tuple=%s payload_rows=%s",
+            len(req_ids),
+            len(draft_token_ids),
+            len(self._dflash_ddtree_payloads)
+            if self._dflash_ddtree_payloads is not None
+            else None,
+            sum(payload is not None for payload in ddtree_payloads)
+            if ddtree_payloads is not None
+            else None,
+        )
+        return DraftTokenIds(req_ids, draft_token_ids, ddtree_payloads)
+
+    def take_dflash_ddtree_payloads(
+        self,
+    ) -> tuple[DDTreeDraftPayload, ...] | None:
+        return self._dflash_ddtree_payloads
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -6232,6 +6823,8 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_prob_token_ids = None
+        self._dflash_ddtree_payloads = None
+        self._ddtree_parent_metadata = None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -6542,6 +7135,27 @@ class GPUModelRunner(
                     self._draft_prob_token_ids = clone_draft_prob_token_ids(
                         draft_token_ids
                     )
+            if hasattr(self.drafter, "take_last_ddtree_payloads"):
+                self._dflash_ddtree_payloads = (
+                    self.drafter.take_last_ddtree_payloads()
+                )
+                first_payload = (
+                    self._dflash_ddtree_payloads[0]
+                    if self._dflash_ddtree_payloads
+                    else None
+                )
+                _dflash_ddtree_debug_log(
+                    "proposal payloads=%s first_flat=%s first_tree=%s",
+                    len(self._dflash_ddtree_payloads)
+                    if self._dflash_ddtree_payloads is not None
+                    else None,
+                    len(first_payload.flat_draft_token_ids)
+                    if first_payload is not None
+                    else None,
+                    len(first_payload.tree_token_ids)
+                    if first_payload is not None
+                    else None,
+                )
 
         return draft_token_ids
 
