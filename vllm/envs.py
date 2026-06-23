@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
+    VLLM_CUSTOM_ALLREDUCE_ALGO: str | None = None
     VLLM_SM70_F16_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_MOE_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_F16_DENSE_MAX_M: int = 64
@@ -1679,6 +1680,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT"])
         if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
         else None
+    ),
+    # Custom all-reduce algorithm selector ("1stage"/"2stage"), read in C++
+    # (custom_all_reduce.cuh). Registered so the multiproc executor forwards it
+    # to worker subprocesses (it only copies registered envs), not just the API
+    # process.
+    "VLLM_CUSTOM_ALLREDUCE_ALGO": lambda: os.getenv(
+        "VLLM_CUSTOM_ALLREDUCE_ALGO", None
     ),
     # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
     # off until the communicator path has same-criterion model evidence.
