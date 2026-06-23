@@ -226,6 +226,19 @@ fork (sublayer saturation guard, shared-expert gate-first ordering) are on by
 default and are required for correct output — without them the model's
 super-weight activation channels overflow fp16 and produce garbage tokens.
 
+On 1Cat-vLLM 1.2.1+, three more SM70 notes apply to this profile:
+
+- The Qwen GDN full-forward guard (which prevents FULL-CUDA-graph decode
+  corruption) is now armed by default for non-MTP serving too, not just MTP, so
+  decode is coherent out of the box. It can still be forced or disabled with
+  `VLLM_SM70_QWEN_GDN_FULL_FORWARD` / `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD`.
+- `VLLM_SM70_QUANT_BACKEND=marlin` gives a small (~2%) single-stream decode
+  speedup over the default TurboMind route on this model. The MoE experts stay on
+  the V100-optimized TurboMind path either way; only the dense GEMMs change.
+- `--kv-cache-dtype fp8_e5m2` is effectively required here: 1.2.1 has a larger
+  base memory footprint, and fp16 KV at this context OOMs at KV-cache init on the
+  32 GB V100s.
+
 Required GDN (linear attention) kernel configuration:
 
 ```bash

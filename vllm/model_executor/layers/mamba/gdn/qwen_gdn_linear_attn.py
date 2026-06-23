@@ -2134,7 +2134,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self.auto_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and vllm_config.speculative_config is not None
+            # 1Cat: auto-arm for NON-MTP SM70 Qwen GDN as well, not just MTP.
+            # The FULL-graph split GDN forward corrupts decode on non-spec models
+            # too (e.g. 397B TP8); the full-forward opaque boundary is the fix.
+            # Upstream gated this on speculative_config (their audit was MTP-only),
+            # which left non-MTP serving silently broken unless the launcher set
+            # VLLM_SM70_QWEN_GDN_FULL_FORWARD=1. Dropping that clause makes non-MTP
+            # serving correct by default. (force_/disable_ overrides still apply.)
             and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
             and not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
         )
