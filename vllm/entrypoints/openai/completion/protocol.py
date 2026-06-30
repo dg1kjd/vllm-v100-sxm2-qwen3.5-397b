@@ -269,6 +269,11 @@ class CompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+        if (thinking_token_budget := self.thinking_token_budget) is None:
+            # Inherit a server-side default (e.g. set via
+            # --override-generation-config) so reasoning loops are bounded even
+            # when the client omits the field.
+            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
 
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
@@ -341,7 +346,7 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
         )
 
     @model_validator(mode="before")
