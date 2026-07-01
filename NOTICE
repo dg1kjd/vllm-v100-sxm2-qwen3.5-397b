@@ -1,0 +1,26 @@
+vllm-v100-sxm2-qwen3.5-397b
+Copyright 2026 Jens David
+
+This product is a downstream fork of 1Cat-vLLM
+(https://github.com/1CatAI/1Cat-vLLM), which is itself a fork of vLLM
+(https://github.com/vllm-project/vllm). It is distributed under the terms of the
+Apache License, Version 2.0. See the LICENSE file for the full text, including
+the Disclaimer of Warranty (Section 7) and Limitation of Liability (Section 8).
+
+Portions of this software are derived from or build upon:
+  - vLLM                  — the vLLM contributors (Apache-2.0)
+                            https://github.com/vllm-project/vllm
+  - 1Cat-vLLM             — SM70 / Tesla V100 enablement, TurboMind-derived AWQ
+                            kernels, and the FLASH_ATTN_V100 attention path
+                            (Apache-2.0) https://github.com/1CatAI/1Cat-vLLM
+  - lmdeploy / TurboMind  — https://github.com/InternLM/lmdeploy
+  - flash-attention-v100  — https://github.com/ai-bond/flash-attention-v100
+  - marlin_v100           — https://github.com/zhinianqin/marlin_v100
+
+Model weights referenced by this recipe are the property of their respective
+authors and are governed by their own licenses, not this one:
+  - Qwen/Qwen3.5-397B-A17B and derived quantizations — Apache-2.0
+  - prefeitura-rio/Rio-3.5-Open-397B                 — MIT
+
+This software is provided "AS IS", without warranty of any kind, express or
+implied. You assume all risk of use.

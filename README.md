@@ -1,6 +1,302 @@
+# vLLM on 8× Tesla V100-SXM2-32GB — Qwen3.5-397B-A17B (AWQ) for agentic coding & ops
+
+A reproducible recipe for serving the **Qwen3.5-397B-A17B** mixture-of-experts model
+(and derivatives such as [`prefeitura-rio/Rio-3.5-Open-397B`](https://huggingface.co/prefeitura-rio/Rio-3.5-Open-397B))
+as a **4-bit AWQ** checkpoint across **eight Tesla V100-SXM2-32GB GPUs** (an original
+NVIDIA DGX-1 / DGX-1-class board, hybrid cube-mesh NVLink, **no NVSwitch**), for use as
+a **local, always-on backend for agentic coding and system-ops work**.
+
+This is a downstream fork of **[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)** (which
+itself forks **[vLLM](https://github.com/vllm-project/vllm)**). 1Cat did the hard SM70/Volta
+enablement — TurboMind-derived AWQ kernels, the `FLASH_ATTN_V100` attention path, and the
+Gated-Delta-Net (GDN) support that a Qwen3.5 MoE needs. **This fork adds the integration and
+tuning needed to push that stack to the top of its own hardware range: a full 8-GPU box and a
+~400B-parameter model, served as a stable agentic baseload.** See
+[How this differs from 1Cat-vLLM](#how-this-differs-from-1cat-vllm).
+
+> The complete, unmodified upstream **1Cat-vLLM README** is reproduced verbatim at the
+> [end of this document](#appendix--original-1cat-vllm-readme-verbatim).
+
+---
+
+## What this is, and who it's for
+
+Ex-datacenter **DGX-1 blades** and loose **V100-SXM2** boards are now cheap on the
+second-hand market. They are Volta (**SM70**): **fp16 only**, no bf16, no fp8 compute, and
+AWQ normally wants sm_75+. 1Cat-vLLM solves the kernel side. What's been missing is a
+worked, end-to-end recipe for the *largest* thing such a box can usefully run:
+
+- **Hardware:** 8× Tesla V100-SXM2-32GB (256 GB aggregate VRAM), DGX-1-style hybrid
+  cube-mesh NVLink, **no NVSwitch**.
+- **Model:** Qwen3.5-397B-A17B — a ~403B-parameter MoE (17B active, 512 experts + shared
+  expert, ~60 layers of which ~75% are GDN linear-attention, plus full-attention layers, a
+  native vision tower, and an optional MTP head) — quantized to **4-bit AWQ** (~230 GB on
+  disk, ~28 GiB per GPU under TP8).
+- **Workload:** single- to few-stream **agentic coding and ops** — long context, tool
+  calling, reasoning separation — not high-concurrency batch serving.
+
+If that's your box and your goal, this repo is a clone-build-serve path that works.
+
+## Results to expect (8× V100-SXM2-32GB, TP8, this config)
+
+| Metric | Value |
+|---|---|
+| Decode, 1 stream | **~41 tok/s** (~90% of the fp16-golden practical ceiling on this HW) |
+| Decode, aggregate (sum-tg) | **~41 / 60 / 96 / 131 tok/s** at 1 / 2 / 4 / 8 concurrent streams |
+| Prefill (cold) | ~2,000 tok/s at 4k ctx → ~750 tok/s at 120k ctx (O(n²) attention) |
+| Prefill (prefix-cache hit) | tens of thousands of tok/s |
+| Context | **140,000 tokens** in production (empirical ceiling ~155–168k) |
+| Startup to ready | ~5–6 min (weights ~3 min) |
+
+Decode is **all-reduce-bound** on this PCIe/NVLink-hybrid topology; the custom 1-stage
+all-reduce is already the best lever. Aggregate throughput scales cleanly to 8 streams.
+**Do not run ≥16 concurrent streams** on this build — there is a known NCCL all-reduce
+deadlock (see [Gotchas](#configuration-notes--gotchas)).
+
+## How this differs from 1Cat-vLLM
+
+1Cat-vLLM targets **2× and 4× V100** setups (they also make 2×/4× SXM2 baseboards and PCIe
+adapters) and models up to ~122B. This fork is **complementary**, aimed one tier up:
+
+| | 1Cat-vLLM public profiles | This recipe |
+|---|---|---|
+| GPUs | 2× / 4× V100 | **8× V100-SXM2 (DGX-1)** |
+| Reference model | Qwen3.6-27B / 35B / 122B AWQ | **Qwen3.5-397B-A17B AWQ (~400B)** |
+| Parallelism | TP1–TP4 | **TP8** |
+| Use case | general V100 serving | **agentic coding/ops baseload** |
+
+The substantive additions this fork carries on top of 1Cat v1.2.1 (all in git history):
+
+- **Non-MTP GDN full-forward auto-arm** — 1Cat's v1.2.1 only auto-arms the FULL-cudagraph
+  GDN decode-corruption guard when MTP speculative decoding is on. A non-MTP MoE (like this
+  397B profile) otherwise gets silent decode corruption. This fork auto-arms it for non-MTP
+  too. *(This is the one fix that helps any non-MTP SM70 MoE user, not just DGX-1 owners.)*
+- **fp16 super-weight overflow saturation** and **shared-expert gate ordering** — SM70
+  numerical-correctness fixes for the MoE path.
+- **GDN autotune pin** for the Volta chunk-scaled-dot kernel (part of the memory fix).
+- **All-reduce-algo env forwarded to workers**, **scheduler starvation warning**, an
+  **Anthropic `/v1/messages` mid-conversation system-role** fix, and a **server-side
+  `thinking_token_budget`** default that stops reasoning-mode from looping to empty output.
+- A small **fleet regression harness** and an **MTP-branch AWQ quant** helper.
+
+---
+
+## Install
+
+### 0. Prerequisites
+
+- **8× Tesla V100-SXM2-32GB**, one host, NVLink up (`nvidia-smi topo -m`), persistence mode on.
+- **Ubuntu 24.04 LTS**, **Python 3.12**, **CUDA toolkit 12.8**, a recent NVIDIA driver.
+- **~250 GB free disk** for the AWQ checkpoint (and ~300 GB system RAM *only if you quantize
+  it yourself*, see [step 3c](#3c-quantize-it-yourself)).
+- Confirm the GPUs are free — this recipe uses all 8. Nothing else can share them while it runs.
+
+### 1. Clone
+
+```bash
+git clone https://github.com/dg1kjd/vllm-v100-sxm2-qwen3.5-397b.git
+cd vllm-v100-sxm2-qwen3.5-397b
+```
+
+### 2. Build or install the engine
+
+The SM70 patches in this fork are Python-only on top of 1Cat v1.2.1's compiled extensions,
+so the fastest path is to **install 1Cat's prebuilt v1.2.1 wheel for its CUDA extensions,
+then run this source tree** (which carries the patches):
+
+```bash
+# Python 3.12 env
+python -m venv .venv && . .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+
+# Get 1Cat's prebuilt SM70 wheel (CUDA 12.8 / torch 2.10) — bundles flash_attn_v100 + SM70 kernels
+#   https://github.com/1CatAI/1Cat-vLLM/releases/latest   (asset: 1cat_vllm-1.2.1-cp312-cp312-linux_x86_64.whl)
+
+# Install this fork editable, reusing that wheel's compiled .so (no nvcc needed):
+VLLM_USE_PRECOMPILED=1 \
+VLLM_PRECOMPILED_WHEEL_LOCATION=/path/to/1cat_vllm-1.2.1-cp312-cp312-linux_x86_64.whl \
+  python -m pip install -e . --no-build-isolation --no-deps
+# Copy the flash_attn_v100 .so out of the wheel into ./flash-attention-v100/ if the editable
+# layout doesn't find it (the wheel places ext modules as siblings, not in-package).
+```
+
+Prefer a **full source build** (needed only if you change CUDA/C++/Triton code)? Follow the
+[upstream Source Build section](#appendix--original-1cat-vllm-readme-verbatim) but set
+`TORCH_CUDA_ARCH_LIST="7.0"` and `FLASH_ATTN_V100_CUDA_ARCH_LIST="7.0"`.
+
+> **Always launch the server from *outside* this checkout** (e.g. `cd ~` or a work dir).
+> Running inside the tree makes Python import the local `vllm/` package instead of the
+> compiled extensions and fails with a `vllm._C` import error.
+
+Verify:
+
+```bash
+cd /tmp && python - <<'PY'
+import torch, triton, vllm, flash_attn_v100
+print("torch", torch.__version__, "cuda", torch.version.cuda, "| vllm", vllm.__version__, "| fa_v100", flash_attn_v100.__version__)
+PY
+```
+
+### 3. Get the weights
+
+The model and its permissive derivative are public. Pick one of three:
+
+#### 3a. A ready public AWQ (fastest, but validate load)
+
+```
+cyankiwi/Qwen3.5-397B-A17B-AWQ-4bit      # Apache-2.0; keeps GDN/linear_attn in fp16 (correct)
+```
+Caveat: this checkpoint is **compressed-tensors "pack-quantized", symmetric, group_size 32** —
+a *different* scheme than the `W4A16_ASYM g128` this stack is validated against. It may load
+and serve, but **test coherence + a needle retrieval before trusting it**.
+
+#### 3b. Not recommended: the official GPTQ-Int4
+
+```
+Qwen/Qwen3.5-397B-A17B-GPTQ-Int4         # Apache-2.0
+```
+This one sets `modules_to_not_convert: []` — it **quantizes the GDN/linear-attention path and
+attention too**, which is exactly the corruption-prone region this stack keeps in fp16, and it
+routes every GEMM through the slow Volta marlin backport. Fine for other engines; **not** this one.
+
+#### 3c. Quantize it yourself (the validated path)
+
+Reproduces the checkpoint this stack is built around. Base weights:
+`Qwen/Qwen3.5-397B-A17B` (Apache-2.0) or `prefeitura-rio/Rio-3.5-Open-397B` (MIT).
+
+- Tool: `llm-compressor`, `pipeline="sequential"`, `oneshot_device="cuda:0"` (single-GPU,
+  the other 7 idle), `torch_dtype="float16"` (**never bf16**).
+- Scheme: **`W4A16_ASYM`, `group_size=128`, AutoAWQ-compatible asymmetric INT4**.
+- **Ignore list (keep in fp16):** `lm_head`, MoE router gates, the shared-expert gate, the
+  **GDN / linear-attention projections**, and the **entire vision tower**. Copy the ignore
+  list verbatim from your AWQ reference's `config.json` — do not invent regexes.
+- Budget ~300 GB RAM, offload to CPU (**never spill to SSD**), ~3–6 h data-free. Checkpoint
+  per layer so a crash resumes. Output `quantization_config` must diff-clean against the
+  reference (format, bits, group_size, zero_point, ignore list).
+
+The MTP-drafter branch (if you serve MTP) can be AWQ'd separately with
+`tools/quantize_qwen3_5_mtp_awq.py`.
+
+### 4. Serve
+
+Two options in [`deploy/`](deploy/) — both default to **140k context, TP8, fp8_e5m2 KV,
+the full SM70 tuning, and multi-stream cudagraph capture**. Edit the `/path/to/…` placeholders
+and the model path first.
+
+**a) One-shot script** (foreground, with GPU-busy guard, KV-fit retry, and a warmup ping):
+
+```bash
+MODEL=/path/to/Qwen3.5-397B-A17B-AWQ PY=/path/to/.venv/bin/python WORKDIR=/tmp \
+  ./deploy/serve.sh 8000
+```
+
+**b) systemd service** (always-on, restart-on-crash, boot-enabled):
+
+```bash
+cp deploy/vllm-397b.env.example /path/to/vllm-397b.env    # edit MODEL + tunables
+# edit deploy/vllm-397b.service: set User=, the venv python, WorkingDirectory, EnvironmentFile
+sudo install -m 0644 deploy/vllm-397b.service /etc/systemd/system/vllm-397b.service
+sudo systemctl daemon-reload && sudo systemctl enable --now vllm-397b
+journalctl -u vllm-397b -f
+```
+
+> ⚠️ Both bind `0.0.0.0` with **no authentication**. On a shared or reachable network,
+> firewall the port, bind `127.0.0.1` + SSH-tunnel, or add `--api-key`.
+
+### 5. Smoke test
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.5-397B-A17B-AWQ","messages":[{"role":"user","content":"Capital of France, one word."}],"temperature":0,"max_tokens":16}'
+```
+
+A short coherent answer (e.g. `Barcelona`) means the GDN full-forward guard is doing its job and
+the AWQ/kernel path is healthy. For agentic use, point any OpenAI-compatible coding agent at
+`http://<host>:8000/v1`; tool calling (`qwen3_coder`) and reasoning separation (`qwen3`) are on.
+
+---
+
+## Configuration notes & gotchas
+
+Hard-won settings baked into `deploy/` — change them only if you know why:
+
+- **`--gpu-memory-utilization 0.95` is the wall.** Above ~0.95 you hit runtime CUDA OOM (per-rank
+  memory jitters decide which); below it the requested context fails the KV-fit check. The KV
+  pool fills whatever util allows.
+- **`--kv-cache-dtype fp8_e5m2` is required**, not optional — the v1.2.1 base footprint OOMs
+  KV init with fp16 KV at this context/util. Needle-validated well past 110k.
+- **GDN decode-corruption guard** (`VLLM_SM70_QWEN_GDN_FULL_FORWARD`) — auto-armed by this fork
+  for non-MTP; the env is set belt-and-suspenders. Without it, FULL-cudagraph decode is garbage.
+- **`--compilation-config '{"cudagraph_capture_sizes":[1,2,4,8]}'`** — the SM70 default captures
+  only `[1,2]`, so a batch of 4 falls to eager and *collapses* to ~5 tok/s/stream. This restores
+  clean scaling to 8 streams. (Costs ~0.03–0.28 GiB of graph memory; re-check the 140k fit.)
+- **`PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8`** — fixes an allocator
+  fragmentation OOM in the SM70 MoE temp-buffer path (looked like an all-reduce hang). Do **not**
+  use `expandable_segments` (breaks custom all-reduce graph capture on this topology).
+- **`--skip-mm-profiling`** — the native vision tower's profiling pass inflates the activation
+  estimate and costs ~90k tokens of context. Text-only serving is safe without it.
+- **GDN kernel knobs** (`VLLM_SM70_GDN_*` in the env) — the Volta autotune that reclaims ~1.5
+  GiB/rank; leave them as shipped.
+- **Prefix caching** needs `--max-num-batched-tokens ≥` the mamba block size (1056 here); the
+  script uses 1059 so one full prefill block fits alongside decodes.
+- **`--override-generation-config '{"thinking_token_budget": 4096}'`** — reasoning mode can
+  otherwise loop to an empty response on hard/unanswerable prompts. Clients override per request
+  (`-1` = unlimited).
+- **Do not run ≥16 concurrent streams.** There is an unresolved NCCL all-reduce deadlock at
+  batch ≥16 on this build (two ranks diverge before the collective). Sweet spot: 4 streams for
+  latency+throughput, 8 for max aggregate.
+
+---
+
+## Contributing
+
+**Issues and PRs are very welcome** — especially from other 8× V100-SXM2 / DGX-1 owners.
+Good things to send back:
+
+- Reproduction reports (your driver / CUDA / checkpoint / numbers).
+- A root-cause or fix for the **≥16-stream NCCL deadlock**.
+- Closing the last ~10% single-stream decode gap vs the fp16 golden (a version-level kernel
+  rebuild).
+- Prefill-side GDN retune on newer Triton.
+- Other large MoE checkpoints validated on this box, or other 8-GPU Volta boards.
+
+If a change is broadly useful (e.g. the non-MTP GDN guard), consider also raising it upstream
+on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM/issues).
+
+## Disclaimer — no warranty
+
+This software is provided **"AS IS", without warranty of any kind**, express or implied. See
+the **Disclaimer of Warranty** and **Limitation of Liability** in [`LICENSE`](LICENSE)
+(Apache-2.0, §7–8). The SM70 kernels, the AWQ-on-Volta path, and the tuning here are
+experimental and hardware-specific; you run them at your own risk. The default launch binds
+`0.0.0.0` with no auth — secure it before exposing it. Serving occupies all 8 GPUs.
+
+## Credits & license
+
+Licensed under **Apache-2.0** (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)). This is a fork
+of **[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)** → **[vLLM](https://github.com/vllm-project/vllm)**,
+and builds on **[lmdeploy/TurboMind](https://github.com/InternLM/lmdeploy)**,
+**[flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)**, and
+**[marlin_v100](https://github.com/zhinianqin/marlin_v100)**. Model weights are © their
+respective authors (**Qwen** / **prefeitura-rio**) under their own licenses.
+
+*Recipe and SM70/V100 integration patches by **Jens David**, developed with assistance from
+Claude (Opus 4.8 and Fable 5).*
+
+---
+
+## Appendix — original 1Cat-vLLM README (verbatim)
+
+The following is the upstream `README.md` from **[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)**
+(tag v1.2.1), reproduced **verbatim and unmodified** for attribution and reference. Its
+launch examples and hardware notes describe 1Cat's 2×/4× V100 profiles, not the 8-GPU 397B
+profile documented above.
+
+---
+
 # 1Cat-vLLM
 
-> 一猫之下始终相信，V100 不该在今天的大模型浪潮里被轻易宣判“过时”。
+> 一猫之下始终相信，V100 不该在今天的大模型浪潮里被轻易宣判"过时"。
 >
 > 1Cat-vLLM 是面向 **SM70 / Tesla V100** 的 vLLM 工程分支。项目围绕
 > AWQ、注意力后端、长上下文稳定性、MTP 投机解码、运行时默认值和部署
@@ -42,7 +338,6 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
-- `tclf90/Qwen3.5-397B-A17B-AWQ` for 8-GPU setups
 
 The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
 Replace them with your local model path or a Hugging Face repository id.
@@ -58,7 +353,6 @@ validation.
 | --- | --- |
 | 4 x Tesla V100 32 GB | Main public reference target |
 | 2 x Tesla V100 32 GB | Supported for selected 27B profiles with lower concurrency |
-| 8 x Tesla V100 32 GB | Required for the 397B MoE profile (SXM2/NVLink recommended) |
 
 Typical model placement:
 
@@ -67,7 +361,6 @@ Typical model placement:
   the long-context public default.
 - `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
 - `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
-- `Qwen3.5-397B-A17B-AWQ`: TP8 only; see the dedicated launch example.
 
 Multimodal defaults:
 
@@ -217,110 +510,6 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-### Qwen3.5-397B-A17B-AWQ, TP8 (8 x V100 32 GB)
-
-Qwen3.5-397B-A17B is a 60-layer hybrid MoE (3 x linear-attention GDN + 1 x
-full attention per group, 512 experts, top-10, ~17B active). The checkpoint is
-bf16-native and runs in fp16 on V100; the SM70 fp16 stability fixes in this
-fork (sublayer saturation guard, shared-expert gate-first ordering) are on by
-default and are required for correct output — without them the model's
-super-weight activation channels overflow fp16 and produce garbage tokens.
-
-On 1Cat-vLLM 1.2.1+, three more SM70 notes apply to this profile:
-
-- The Qwen GDN full-forward guard (which prevents FULL-CUDA-graph decode
-  corruption) is now armed by default for non-MTP serving too, not just MTP, so
-  decode is coherent out of the box. It can still be forced or disabled with
-  `VLLM_SM70_QWEN_GDN_FULL_FORWARD` / `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD`.
-- `VLLM_SM70_QUANT_BACKEND=marlin` gives a small (~2%) single-stream decode
-  speedup over the default TurboMind route on this model. The MoE experts stay on
-  the V100-optimized TurboMind path either way; only the dense GEMMs change.
-- `--kv-cache-dtype fp8_e5m2` is effectively required here: 1.2.1 has a larger
-  base memory footprint, and fp16 KV at this context OOMs at KV-cache init on the
-  32 GB V100s.
-
-Required GDN (linear attention) kernel configuration:
-
-```bash
-export VLLM_SM70_GDN_DELTA_H_BV=16 VLLM_SM70_GDN_DELTA_H_WARPS=4 VLLM_SM70_GDN_DELTA_H_STAGES=1
-export VLLM_SM70_GDN_CHUNK_O_BK=64 VLLM_SM70_GDN_CHUNK_O_BV=64 VLLM_SM70_GDN_CHUNK_O_WARPS=8 VLLM_SM70_GDN_CHUNK_O_STAGES=2
-# optional, trims NCCL buffer memory on 8-GPU boards:
-export NCCL_MAX_NCHANNELS=2 NCCL_MIN_NCHANNELS=1 NCCL_BUFFSIZE=1048576
-```
-
-Do not enable the allocator's `expandable_segments` option
-(`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`): it breaks custom
-all-reduce CUDA graph capture on this TP8 profile.
-
-Long-context profile (110K context, ~50 tok/s single-stream decode,
-~100 tok/s aggregate at 4 streams, prefill 1.7-3.6K tok/s):
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.5-397B-A17B-AWQ \
-  --served-model-name Qwen3.5-397B-A17B-AWQ \
-  --attention-backend FLASH_ATTN_V100 \
-  --tensor-parallel-size 8 \
-  --gpu-memory-utilization 0.94 \
-  --kv-cache-dtype fp8_e5m2 \
-  --max-model-len 110000 \
-  --max-num-seqs 4 \
-  --max-num-batched-tokens 1059 \
-  --enable-prefix-caching \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-Profile notes:
-
-- With hybrid-model prefix caching (`align` mode) the attention block size for
-  this config is 1056 tokens. `max_num_batched_tokens` must leave room for one
-  full block plus one token per other decoding sequence, or waiting prefills
-  starve: `1059 = 1056 + (4 - 1)`.
-- `fp8_e5m2` KV cache is quality-validated at this length (5-needle retrieval
-  10/10 at ~104K across depths 2-98%).
-- The KV budget fits about 1.2 x one full-context request; concurrency is for
-  typical few-K to ~30K sessions, with preemption as the safety valve.
-
-MTP speculative-decoding profile (64K context, ~80 tok/s single-stream
-decode, acceptance ~62-73%, ~3.5 tokens per step): the checkpoint ships its
-MTP draft branch in bf16 (12.3 GiB = 1.5 GiB per rank), which does not fit
-next to the KV budget. Quantize the `mtp.*` expert tensors offline to AWQ
-int4 — `tools/quantize_qwen3_5_mtp_awq.py` does exactly this (RTN int4 g128
-in AWQ GEMM layout, `mtp.fc`/norms kept fp16, `modules_to_not_convert`
-flipped from `"mtp"` to `"mtp.fc"` so the loader takes the quantized path;
-about 0.43 GiB per rank, needs only torch/numpy/safetensors):
-
-```bash
-python tools/quantize_qwen3_5_mtp_awq.py \
-  /path/to/Qwen3.5-397B-A17B-AWQ /path/to/Qwen3.5-397B-A17B-AWQ-mtp-int4
-```
-
-Then change these flags relative to the profile above:
-
-```bash
-  --model /path/to/Qwen3.5-397B-A17B-AWQ-mtp-int4 \
-  --gpu-memory-utilization 0.95 \
-  --max-model-len 64000 \
-  --max-num-batched-tokens 1071 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":true}' \
-```
-
-Each decoding sequence consumes `1 + num_speculative_tokens` tokens of the
-batch budget per step, hence `1071 = 1056 + 3 x 5`. 110K context and MTP do
-not fit together at this memory budget; pick by workload.
-
-Client notes for the thinking-mode Qwen models: send
-`"chat_template_kwargs": {"enable_thinking": true}` and allow 4-8K output
-tokens (thinking length is volatile). Anthropic-style coding agents (for
-example Claude Code) can target the server directly via `ANTHROPIC_BASE_URL`;
-the `/v1/messages` endpoint separates reasoning into native thinking blocks
-and supports parallel tool calls.
-
 ## OpenAI-Compatible Request Example
 
 ```bash
@@ -449,13 +638,6 @@ python -m pip install -e . --no-build-isolation
 - If you publish a baseline, include the full launch command, GPU model,
   driver, CUDA runtime, model checkpoint, sampling parameters, prompt length,
   and decode length.
-
-## A Note on Line Endings
-
-Parts of this tree historically shipped with CRLF — and occasionally mixed —
-line endings. The correct line ending is LF, and LF only: this is a Linux
-inference engine, not a Windows batch script. Configure your editor
-accordingly and spare the next contributor the byte-faithful archaeology.
 
 ## WeChat Community
 
