@@ -1141,6 +1141,12 @@ class GPUModelRunner(
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+
+        # SwiReasoning controller glue (opt-in via SamplingParams.extra_args;
+        # OFF by default -> every hook is a no-op for production requests).
+        from vllm.v1.worker.swir_glue import SwirGlue
+
+        self.swir = SwirGlue(self)
         self.sm70_greedy_token_fastpath = envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH
         self.sm70_greedy_token_fastpath_trace = (
             envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE
@@ -1877,6 +1883,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.swir.on_finished(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -4787,6 +4794,13 @@ class GPUModelRunner(
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
 
+        # SwiReasoning: replace each latent-mode decode row's input embedding
+        # with the controller's stashed continuous-thought vector (no-op unless
+        # a swir request has a pending embedding).
+        input_ids, inputs_embeds = self.swir.maybe_inject(
+            scheduler_output, num_input_tokens, input_ids, inputs_embeds
+        )
+
         return (
             input_ids,
             inputs_embeds,
@@ -6279,6 +6293,15 @@ class GPUModelRunner(
         if trace_log:
             trace_logits_ms = (time.perf_counter() - trace_logits_t0) * 1000.0
 
+        # SwiReasoning: snapshot the original (unfiltered) logits before the
+        # sampler mutates them in place; controller runs after sampling.
+        # On this base logits are computed lazily inside _sample, so when a
+        # swir request is active materialize them here first (same pattern as
+        # the grammar path above; _sample accepts precomputed logits).
+        swir_active = self.swir.any_active()
+        if swir_active and logits is None:
+            logits = self.model.compute_logits(sample_hidden_states)
+        swir_logits = logits.detach().clone() if swir_active else None
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             trace_sample_t0 = time.perf_counter() if trace_log else 0.0
             mtp_sample_start = self._sm70_mtp_profile_start(
@@ -6291,6 +6314,8 @@ class GPUModelRunner(
                 sample_hidden_states,
                 logits_indices,
             )
+            if swir_logits is not None:
+                self.swir.post_sample(scheduler_output, swir_logits, sampler_output)
             self._sm70_mtp_profile_finish(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"],
                 "target_rejection_sample"
