@@ -24,6 +24,8 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import contextlib
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -33,6 +35,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.distributed import (
     get_pp_group,
 )
@@ -115,6 +118,23 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+def _sm70_vit_fp32_enabled() -> bool:
+    # VITFP32_v1: the fp16 vision tower loses residual-stream precision once
+    # register-token activations reach ~500 (block 9+); on text-dense images
+    # the worst merged-token cosine vs fp32 drops to 0.973 (wo_vit_parity.py,
+    # 2026-06-12). Running the whole 0.46B tower in fp32 restores parity;
+    # outputs are cast back to the model dtype at the LLM boundary.
+    if os.getenv("VLLM_SM70_VIT_FP32", "1").lower() in ("0", "false"):
+        return False
+    from vllm.platforms import current_platform
+
+    try:
+        cap = current_platform.get_device_capability()
+    except Exception:
+        return False
+    return cap is not None and cap.major == 7
+
 
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
     raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
@@ -829,12 +849,25 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.is_multimodal_pruning_enabled = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
+            # VITFP32_v1: see _sm70_vit_fp32_enabled
+            vit_dtype_ctx = (
+                set_default_torch_dtype(torch.float32)
+                if _sm70_vit_fp32_enabled()
+                else contextlib.nullcontext()
             )
+            with vit_dtype_ctx:
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
+        if (
+            isinstance(self.visual, Qwen3_VisionTransformer)
+            and self.visual.dtype != vllm_config.model_config.dtype
+        ):
+            # VITFP32_v1: cast tower output back to the LLM dtype
+            self.visual.out_dtype = vllm_config.model_config.dtype
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
@@ -1047,12 +1080,25 @@ class Qwen3_5MoeForConditionalGeneration(
         self.is_multimodal_pruning_enabled = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
+            # VITFP32_v1: see _sm70_vit_fp32_enabled
+            vit_dtype_ctx = (
+                set_default_torch_dtype(torch.float32)
+                if _sm70_vit_fp32_enabled()
+                else contextlib.nullcontext()
             )
+            with vit_dtype_ctx:
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
+        if (
+            isinstance(self.visual, Qwen3_VisionTransformer)
+            and self.visual.dtype != vllm_config.model_config.dtype
+        ):
+            # VITFP32_v1: cast tower output back to the LLM dtype
+            self.visual.out_dtype = vllm_config.model_config.dtype
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5MoeForCausalLM(

@@ -627,6 +627,11 @@ class Qwen3_VisionTransformer(nn.Module):
             ]
         )
 
+        # VITFP32_v1: when set, forward() casts the final embeddings to this
+        # dtype; lets the tower run in a higher precision than the LLM
+        # (SM70 fp16 parity fix, see qwen3_5._sm70_vit_fp32_enabled).
+        self.out_dtype: torch.dtype | None = None
+
     @property
     def dtype(self) -> torch.dtype:
         return self.patch_embed.proj.weight.dtype
@@ -836,6 +841,10 @@ class Qwen3_VisionTransformer(nn.Module):
         hidden_states = torch.cat(
             [hidden_states] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        if self.out_dtype is not None and hidden_states.dtype != self.out_dtype:
+            # VITFP32_v1: cast back to the LLM dtype at the boundary (after the
+            # deepstack cat so the fp32 deepstack features are covered too)
+            hidden_states = hidden_states.to(self.out_dtype)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
