@@ -849,10 +849,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.is_multimodal_pruning_enabled = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            # VITFP32_v1: see _sm70_vit_fp32_enabled
+            # VITFP32_v1: see _sm70_vit_fp32_enabled. Skip when multimodal is
+            # disabled (limits all 0, e.g. the SM70 text-only graph profile):
+            # the fp32 tower costs ~1 GiB/rank of KV headroom for a tower that
+            # never runs (production 140k profile stopped fitting otherwise).
+            _mm_on = any(
+                multimodal_config.get_limit_per_prompt(m) > 0
+                for m in ("image", "video")
+            )
             vit_dtype_ctx = (
                 set_default_torch_dtype(torch.float32)
-                if _sm70_vit_fp32_enabled()
+                if (_mm_on and _sm70_vit_fp32_enabled())
                 else contextlib.nullcontext()
             )
             with vit_dtype_ctx:
@@ -1080,10 +1087,17 @@ class Qwen3_5MoeForConditionalGeneration(
         self.is_multimodal_pruning_enabled = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            # VITFP32_v1: see _sm70_vit_fp32_enabled
+            # VITFP32_v1: see _sm70_vit_fp32_enabled. Skip when multimodal is
+            # disabled (limits all 0, e.g. the SM70 text-only graph profile):
+            # the fp32 tower costs ~1 GiB/rank of KV headroom for a tower that
+            # never runs (production 140k profile stopped fitting otherwise).
+            _mm_on = any(
+                multimodal_config.get_limit_per_prompt(m) > 0
+                for m in ("image", "video")
+            )
             vit_dtype_ctx = (
                 set_default_torch_dtype(torch.float32)
-                if _sm70_vit_fp32_enabled()
+                if (_mm_on and _sm70_vit_fp32_enabled())
                 else contextlib.nullcontext()
             )
             with vit_dtype_ctx:
