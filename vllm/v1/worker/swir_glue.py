@@ -118,6 +118,15 @@ class SwirGlue:
             return None
         return get_swir_args(rs.sampling_params)
 
+    def needs_eager_step(self) -> bool:
+        """True iff the CURRENT batch contains a row whose next input must be
+        an injected embedding — the runner then dispatches this step eager
+        instead of replaying the token-id CUDA graph (Tier-1 graph bypass).
+        Cheap: ``pending_emb`` is empty unless a swir request is mid-flight."""
+        if not self.pending_emb:
+            return False
+        return any(r in self.pending_emb for r in self.runner.input_batch.req_ids)
+
     def any_active(self) -> bool:
         """True if any request currently in the batch is a SwiReasoning request.
         Cheap: ``extra_args`` is None for all production requests."""
@@ -193,11 +202,15 @@ class SwirGlue:
             return
         self._eager_checked = True
         if self.runner.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            raise RuntimeError(
-                "[swir] SwiReasoning requires eager execution "
-                "(per-decode-step inputs_embeds feedback is incompatible with "
-                "captured token-id CUDA graphs -- workorder §4.D). "
-                "Launch with --enforce-eager."
+            # Tier-1 graph bypass (2026-07-02): a graphs-enabled server is fine
+            # now — needs_eager_step() forces CUDAGraphMode.NONE dispatch for
+            # exactly the steps that carry an embedding injection (§4.D only
+            # forbids injecting INTO a replayed token-id graph, which can no
+            # longer happen). Log once for the paper trail.
+            logger.info_once(
+                "[swir] graphs-enabled server: injection steps dispatch eager "
+                "via needs_eager_step(); all other steps replay CUDA graphs.",
+                scope="global",
             )
         if getattr(self.runner, "use_async_scheduling", False):
             raise RuntimeError(

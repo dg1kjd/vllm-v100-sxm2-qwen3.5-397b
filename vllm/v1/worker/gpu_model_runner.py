@@ -5505,6 +5505,14 @@ class GPUModelRunner(
                 "runtime replay."
             )
 
+        # SwiReasoning Tier-1 graph bypass: a step that must inject a
+        # per-request input embedding cannot replay the token-id CUDA graph,
+        # so dispatch just this step eager (CUDAGraphMode.NONE). Batches with
+        # no pending injection — all production traffic and swir prefill —
+        # replay graphs as usual.
+        if not force_eager and self.swir.needs_eager_step():
+            force_eager = True
+
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
