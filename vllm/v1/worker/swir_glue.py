@@ -119,13 +119,25 @@ class SwirGlue:
         return get_swir_args(rs.sampling_params)
 
     def needs_eager_step(self) -> bool:
-        """True iff the CURRENT batch contains a row whose next input must be
-        an injected embedding — the runner then dispatches this step eager
-        instead of replaying the token-id CUDA graph (Tier-1 graph bypass).
-        Cheap: ``pending_emb`` is empty unless a swir request is mid-flight."""
+        """True iff the CURRENT batch carries an embedding injection AND the
+        runner feeds the model token ids (embedding layer inside the captured
+        graph) — only then must the step dispatch eager (Tier-1 bypass).
+
+        Tier-2 (2026-07-02): on the multimodal input path the model is ALWAYS
+        fed from the persistent ``inputs_embeds`` buffer (embedding lookup
+        happens in ``_preprocess``, outside the graph), and ``maybe_inject``
+        writes the soft rows into a VIEW of that buffer before replay — so the
+        replayed graph consumes the injected rows and no eager fallback is
+        needed. ``VLLM_SWIR_TIER1=1`` forces the old per-step eager dispatch
+        for debugging/comparison."""
         if not self.pending_emb:
             return False
-        return any(r in self.pending_emb for r in self.runner.input_batch.req_ids)
+        if not any(r in self.pending_emb for r in self.runner.input_batch.req_ids):
+            return False
+        if os.getenv("VLLM_SWIR_TIER1", "0") == "1":
+            return True
+        # Embeds-entry graph (mm input path): replay is injection-safe.
+        return not self.runner.supports_mm_inputs
 
     def any_active(self) -> bool:
         """True if any request currently in the batch is a SwiReasoning request.
