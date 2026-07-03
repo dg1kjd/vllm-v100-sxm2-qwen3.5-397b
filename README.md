@@ -302,7 +302,7 @@ stock serving (fleet-regression verified).
   stochastic premature closure of the thinking block, which reads as
   "compression" on easy problems and becomes wrong answers on hard ones
   (AIME high-difficulty subset: 11% vs 72% baseline on affected runs; full
-  analysis in the fork's eval notes). The paper's efficiency claim did not
+  analysis in [`evals/swir/`](evals/swir/)). The paper's efficiency claim did not
   reproduce at safe knobs on this fp16/AWQ/V100 stack; treat the feature as an
   experimental mechanism, not a proven efficiency win.
 - Code: `vllm/v1/sample/swir_controller.py` (backend-agnostic FSM) +
