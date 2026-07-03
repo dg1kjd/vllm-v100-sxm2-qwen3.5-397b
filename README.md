@@ -248,6 +248,63 @@ Hard-won settings baked into `deploy/` — change them only if you know why:
 
 ---
 
+## Experimental features from this fork — vision fp32 & SwiReasoning
+
+### Vision tower in fp32 (`VITFP32`)
+
+The Qwen3.5 vision tower overflows fp16's precision on Volta: register-token
+activations reach ~500 by block 9, and on text-dense images the worst merged-token
+cosine vs an fp32 reference drops to 0.973 (visible as OCR/detail degradation).
+This fork builds the tower in **fp32 on SM70** and casts back to the LLM dtype at
+the boundary (after the deepstack concat).
+
+- **Auto-gated:** fp32 only when SM70 *and* multimodal is enabled (any
+  `--limit-mm-per-prompt` > 0; this base defaults `image=1`). Text-only configs
+  keep the fp16 tower automatically. `VLLM_SM70_VIT_FP32=0` opts out explicitly.
+- **Cost: ~1 GiB/rank** — the shipped 140k-context profile no longer passes the
+  KV-fit check with it (ceiling drops to ~138k). `deploy/` therefore ships
+  `VLLM_SM70_VIT_FP32=0` (vision still works, at upstream fp16 quality). To serve
+  fp32 vision: drop that env line and set `--max-model-len` ≤ 138000.
+
+### SwiReasoning (opt-in continuous-thought decoding)
+
+An implementation of [SwiReasoning](https://arxiv.org/abs/2510.05069) — an
+entropy-trend FSM that switches the model between latent and explicit reasoning
+by injecting soft (probability-blended) input embeddings between decode steps.
+Strictly **opt-in per request**; traffic without the key is byte-identical to
+stock serving (fleet-regression verified).
+
+```jsonc
+// POST /v1/chat/completions — pass token ids from the model's tokenizer
+"vllm_xargs": { "swireasoning": {
+  "think_id": 248068, "end_think_id": 248069, "line_break_id": 1639,
+  "eos_token_id": 248046,
+  "convergence_ids": [248069],                         // encode("</think>")
+  "termination_ids": [248069, 271, 760, 1534, 4087, 369],
+  "alpha_0": 0.5, "beta_0": 0.7, "window_size": 512,
+  "max_switch_count": null, "termination_max_tokens": 32,
+  "max_new_tokens": 4096, "math_ids": null
+} }
+```
+
+- **Server requirement:** `--no-async-scheduling` (already in `deploy/`). Runs on
+  the normal graph-enabled server: on the multimodal input path the decode graph
+  is embeds-entry, so injections ride graph replay natively; token-id-path
+  configs fall back to per-step eager dispatch automatically.
+  `VLLM_SWIR_TIER1=1` forces the per-step-eager mode; `VLLM_SWIR_DEBUG=1` logs
+  the FSM per step.
+- **Measured on this rig (Rio-397B AWQ, TP8):** accuracy neutral-to-positive
+  (GSM8K full test set 96.4% vs 96.1% baseline; AIME'24+'25 @8k budget: tie,
+  with all 19 baseline budget-cappings eliminated). **Token savings depend on the
+  kernel-numerics regime**: −45% on an `--enforce-eager` server, −25% mixed,
+  only −3.5% under full compiled graphs — the entropy-trend FSM is sensitive to
+  last-bit logit noise, so retune `alpha_0`/`beta_0` in your serving regime if
+  token efficiency is the goal.
+- Code: `vllm/v1/sample/swir_controller.py` (backend-agnostic FSM) +
+  `vllm/v1/worker/swir_glue.py` (runner adapter, 5 one-line hooks).
+
+---
+
 ## Contributing
 
 **Issues and PRs are very welcome** — especially from other 8× V100-SXM2 / DGX-1 owners.
