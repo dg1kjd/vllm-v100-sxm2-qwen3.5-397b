@@ -281,7 +281,7 @@ stock serving (fleet-regression verified).
   "eos_token_id": 248046,
   "convergence_ids": [248069],                         // encode("</think>")
   "termination_ids": [248069, 271, 760, 1534, 4087, 369],
-  "alpha_0": 0.5, "beta_0": 0.7, "window_size": 512,
+  "alpha_0": 1.0, "beta_0": 0.7, "window_size": 512,
   "max_switch_count": null, "termination_max_tokens": 32,
   "max_new_tokens": 4096, "math_ids": null
 } }
@@ -293,13 +293,18 @@ stock serving (fleet-regression verified).
   configs fall back to per-step eager dispatch automatically.
   `VLLM_SWIR_TIER1=1` forces the per-step-eager mode; `VLLM_SWIR_DEBUG=1` logs
   the FSM per step.
-- **Measured on this rig (Rio-397B AWQ, TP8):** accuracy neutral-to-positive
-  (GSM8K full test set 96.4% vs 96.1% baseline; AIME'24+'25 @8k budget: tie,
-  with all 19 baseline budget-cappings eliminated). **Token savings depend on the
-  kernel-numerics regime**: −45% on an `--enforce-eager` server, −25% mixed,
-  only −3.5% under full compiled graphs — the entropy-trend FSM is sensitive to
-  last-bit logit noise, so retune `alpha_0`/`beta_0` in your serving regime if
-  token efficiency is the goal.
+- **Measured on this rig (Rio-397B AWQ, TP8) — read before using:** with the
+  reference knobs above (`alpha_0=1.0`), SwiReasoning is **accuracy-neutral and
+  token-neutral** under sampling (GSM8K n=200: 93.5% both arms, tokens +3%;
+  AIME'24+'25 n=60×2: 0.82-0.83 vs 0.82 baseline). **Do not run `alpha_0 < 1.0`
+  on this stack**: the earlier-reported token savings (−45% eager / −35% graphs)
+  came from `alpha_0=0.5` and turned out to be substantially an artifact —
+  stochastic premature closure of the thinking block, which reads as
+  "compression" on easy problems and becomes wrong answers on hard ones
+  (AIME high-difficulty subset: 11% vs 72% baseline on affected runs; full
+  analysis in the fork's eval notes). The paper's efficiency claim did not
+  reproduce at safe knobs on this fp16/AWQ/V100 stack; treat the feature as an
+  experimental mechanism, not a proven efficiency win.
 - Code: `vllm/v1/sample/swir_controller.py` (backend-agnostic FSM) +
   `vllm/v1/worker/swir_glue.py` (runner adapter, 5 one-line hooks).
 
